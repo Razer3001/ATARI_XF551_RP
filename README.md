@@ -337,9 +337,6 @@ La recomendación es mantener una rama estable y aplicar mejoras de manera incre
 
 ## Licencia
 
-Definir según preferencia del autor.
-
-
 - MIT
 
 ---
