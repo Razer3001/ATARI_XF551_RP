@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include "DiskDensityTypes.h"
 #include "EspNowQueueTypes.h"
+#include "BridgeProtocol.h"
 
 #ifndef ESP_IDF_VERSION_MAJOR
 #define ESP_IDF_VERSION_MAJOR 4
@@ -25,23 +26,10 @@ HardwareSerial SerialSIO(2);
 #define SIO_ERROR    0x45
 
 // ======== Protocolo ESP-NOW ========
-#define TYPE_HELLO         0x20
-#define TYPE_CMD_FRAME     0x01
-#define TYPE_SECTOR_CHUNK  0x10
-#define TYPE_ACK           0x11
-#define TYPE_NAK           0x12
-#define TYPE_TIMING_UPDATE 0x30
-
-// NUEVO CFG
-#define TYPE_CFG_UPDATE    0x40
-#define TYPE_CFG_ACK       0x41
-
-#define CHUNK_PAYLOAD     244
+// Tipos TYPE_* , CHUNK_PAYLOAD y PERCOM_* vienen desde BridgeProtocol.h
 #define MAX_SECTOR_BYTES  256
 #define SECTOR_128        128
 #define SECTOR_256        256
-#define PERCOM_BLOCK_LEN  12
-#define PERCOM_SEC_MAGIC  0xFFFF
 #define MAX_PREFETCH_SECTORS 26
 
 #define ESPNOW_CHANNEL 1
@@ -93,12 +81,17 @@ static inline void markActivity() { g_lastActivityMs = millis(); }
 static inline bool isIdleFor(uint32_t ms) { return (millis() - g_lastActivityMs) > ms; }
 
 static const uint32_t INTERBYTE_GAP_MS = 200;   // Restaurado
-static const uint32_t DRAIN_MS         = 2;     // Camino rápido: drenado ultra corto en discos sanos
-static const uint8_t  AUTO_READAHEAD_EXTRA = 4; // Base: sector actual + 4 adelantados
-static const uint8_t  AUTO_READAHEAD_SEQ_EXTRA = 25; // En secuencia, preferir hasta fin de pista/cache
+static const uint32_t DRAIN_MS         = 1;     // Camino rápido: drenado mínimo
+static const uint8_t  AUTO_READAHEAD_EXTRA = 0; // v16: sin read-ahead automático
+static const uint8_t  NEXT_TRACK_PRELOAD_THRESHOLD = 0; // v16: next-track preload desactivado
+static const uint8_t  NEXT_TRACK_PRELOAD_SECTORS   = 0; // v16: next-track preload desactivado
+static const uint8_t  BOOT_CACHE_SECTORS          = 3; // Sectores 1-3: cache dedicada de arranque
+static const uint8_t  TRACK_BURST_SECTORS         = 3; // v18: micro-burst dentro de la misma pista
+static const uint8_t  AUTO_READAHEAD_SEQ_EXTRA = 0; // v16: sin secuencia automática
 static const uint32_t SERIAL_DEBUG_BAUD = 460800;
 static const bool LOG_READ_OK = false;
 static const bool LOG_CACHE_HIT = false;
+static const bool LOG_CACHE_DIAG = false; // v18: apagar diag por defecto para velocidad
 static const bool LOG_PREFETCH = false;
 static const bool LOG_RECOVER  = false;
 
@@ -123,13 +116,12 @@ static bool g_ddForceActive = false;
 static uint32_t g_lastDdForceMs = 0;
 static DiskDensity g_last128Density = DENS_SD;
 
+
 // STATUS lógico temporal para no arrastrar errores crudos de la XF551
+// cuando FORMAT/WRITE ya terminaron correctamente.
 static bool g_statusOverrideActive = false;
 static uint8_t g_statusOverride[4] = {0x00, 0xFF, 0xFE, 0x00};
 static uint32_t g_statusOverrideUntilMs = 0;
-static uint32_t g_lastIoActivityMs = 0;
-static bool g_forceMediaProbe = true;
-static const uint32_t kMediaChangeIdleWindowMs = 5000;
 
 static inline const char* densityName(DiskDensity d) {
   switch (d) {
@@ -149,52 +141,12 @@ static inline void remember128Density(DiskDensity d) {
 }
 
 static inline DiskDensity hostVisibleDensity() {
-  if (g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) return g_diskDensity;
+  if (g_ddForceActive) return DENS_DD;
+  if (g_diskDensityKnown) {
+    if (g_diskDensity == DENS_DD) return g_last128Density;
+    return g_diskDensity;
+  }
   return g_last128Density;
-}
-
-static inline void clearStatusOverride() {
-  g_statusOverrideActive = false;
-  g_statusOverrideUntilMs = 0;
-}
-
-static inline void markIoActivity() {
-  g_lastIoActivityMs = millis();
-}
-
-static inline void resetReadCacheAndSequence();
-static inline void resetPendingTransferState();
-static inline void mediaSoftReset(const char* why);
-static inline void maybeResetOnDiskChangeWindow(uint8_t nextCmd);
-
-static inline bool statusOverrideIsActive() {
-  if (!g_statusOverrideActive) return false;
-  if ((int32_t)(g_statusOverrideUntilMs - millis()) <= 0) {
-    clearStatusOverride();
-    return false;
-  }
-  return true;
-}
-
-static inline void buildCleanStatusForDensity(DiskDensity d, uint8_t st[4]) {
-  st[0] = 0x00;
-  if (d == DENS_ED) st[0] = 0x80;
-  else if (d == DENS_DD) st[0] = 0x20;
-  st[1] = 0xFF;
-  st[2] = (d == DENS_ED) ? 0xE0 : 0xFE;
-  st[3] = 0x00;
-}
-
-static inline void armStatusOverrideForDensity(DiskDensity d, uint32_t durationMs, const char* reason) {
-  buildCleanStatusForDensity(d, g_statusOverride);
-  g_statusOverrideActive = true;
-  g_statusOverrideUntilMs = millis() + durationMs;
-  if (reason && *reason) {
-    logf("[SLAVE] STATUS lógico limpio armado (%s) dens=%s bytes=%02X %02X %02X %02X por %lums",
-         reason, densityName(d),
-         g_statusOverride[0], g_statusOverride[1], g_statusOverride[2], g_statusOverride[3],
-         (unsigned long)durationMs);
-  }
 }
 
 static inline uint16_t expectedSectorSizeForMode(DiskDensity d, uint16_t sec) {
@@ -212,6 +164,43 @@ static inline uint16_t sectorsPerTrackForDensity(DiskDensity d) {
   return g_diskSectorsPerTrack ? g_diskSectorsPerTrack : 18;
 }
 
+
+static inline void clearStatusOverride() {
+  g_statusOverrideActive = false;
+  g_statusOverrideUntilMs = 0;
+}
+
+static inline bool statusOverrideIsActive() {
+  if (!g_statusOverrideActive) return false;
+  if ((int32_t)(g_statusOverrideUntilMs - millis()) <= 0) {
+    clearStatusOverride();
+    return false;
+  }
+  return true;
+}
+
+static inline void buildCleanStatusForDensity(DiskDensity d, uint8_t st[4]) {
+  st[0] = 0x00;
+  if (d == DENS_ED) st[0] |= 0x80;
+  st[1] = 0xFF;
+  st[2] = (d == DENS_ED) ? 0xE0 : 0xFE;
+  st[3] = 0x00;
+}
+
+static inline void armStatusOverrideForDensity(DiskDensity d, uint32_t durationMs, const char* reason) {
+  if (d == DENS_DD && !g_ddForceActive) d = hostVisibleDensity();
+  buildCleanStatusForDensity(d, g_statusOverride);
+  g_statusOverrideActive = true;
+  g_statusOverrideUntilMs = millis() + durationMs;
+  if (reason && *reason) {
+    logf("[SLAVE] STATUS lógico limpio armado (%s) dens=%s bytes=%02X %02X %02X %02X por %lums",
+         reason,
+         densityName(d),
+         g_statusOverride[0], g_statusOverride[1], g_statusOverride[2], g_statusOverride[3],
+         (unsigned long)durationMs);
+  }
+}
+
 static inline uint8_t sectorsRemainingInTrack(uint16_t sec, DiskDensity d) {
   if (sec <= 3) return 1;
   uint16_t spt = sectorsPerTrackForDensity(d);
@@ -222,6 +211,22 @@ static inline uint8_t sectorsRemainingInTrack(uint16_t sec, DiskDensity d) {
   if (rem > 255) rem = 255;
   return (uint8_t)rem;
 }
+
+static inline uint16_t trackStartForSector(uint16_t sec, DiskDensity d) {
+  if (sec <= 3) return sec;
+  uint16_t spt = sectorsPerTrackForDensity(d);
+  if (spt == 0) spt = 18;
+  return (uint16_t)(4 + (((sec - 4) / spt) * spt));
+}
+
+static inline uint8_t sectorIndexInTrack(uint16_t sec, DiskDensity d) {
+  if (sec <= 3) return 0;
+  uint16_t spt = sectorsPerTrackForDensity(d);
+  if (spt == 0) spt = 18;
+  return (uint8_t)((sec - 4) % spt);
+}
+
+
 
 const uint8_t BCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -239,18 +244,125 @@ static void xfDiagProbeSector(uint8_t devLogical, uint16_t sec, DiskDensity mode
 uint8_t g_lastMaster[6] = {0};
 bool    g_haveMasterMac = false;
 
-// PREFETCH CACHE
+// TRACK CACHE
 static uint8_t  cacheBuf[MAX_PREFETCH_SECTORS][MAX_SECTOR_BYTES];
-static uint16_t cacheFirstSec = 0;
-static uint8_t  cacheCount    = 0;
-static uint8_t  cacheDev      = 0;
-static DiskDensity cacheDensity = DENS_UNKNOWN;
+static uint32_t cacheValidMask = 0;   // 1 bit por sector dentro de la pista actual
+static uint16_t cacheTrackStartSec = 0;
+static uint8_t  cacheTrackSpt      = 0;
+static uint8_t  cacheCount         = 0;   // cantidad de sectores válidos en la pista actual
+static uint8_t  cacheDev           = 0;
+static DiskDensity cacheDensity    = DENS_UNKNOWN;
+
+// NEXT TRACK CACHE (precarga conservadora de la pista siguiente)
+static uint8_t  cacheNextBuf[MAX_PREFETCH_SECTORS][MAX_SECTOR_BYTES];
+static uint32_t cacheNextValidMask = 0;
+static uint16_t cacheNextTrackStartSec = 0;
+static uint8_t  cacheNextTrackSpt      = 0;
+static uint8_t  cacheNextCount         = 0;
+static uint8_t  cacheNextDev           = 0;
+static DiskDensity cacheNextDensity    = DENS_UNKNOWN;
+
+// BOOT CACHE (sectores 1-3)
+static uint8_t  bootCacheBuf[BOOT_CACHE_SECTORS][MAX_SECTOR_BYTES];
+static uint8_t  bootCacheValidMask = 0;
+static uint8_t  bootCacheDev       = 0;
 
 // SEQUENTIAL READ TRACKING
 static uint16_t    lastReadSec     = 0;
 static uint8_t     lastReadDev     = 0;
 static DiskDensity lastReadDensity = DENS_UNKNOWN;
 static uint8_t     seqReadStreak   = 0;
+
+static inline void invalidateNextTrackCache() {
+  cacheNextValidMask = 0;
+  cacheNextTrackStartSec = 0;
+  cacheNextTrackSpt = 0;
+  cacheNextCount = 0;
+  cacheNextDev = 0;
+  cacheNextDensity = DENS_UNKNOWN;
+}
+
+static inline void resetTrackCache() {
+  cacheValidMask = 0;
+  cacheTrackStartSec = 0;
+  cacheTrackSpt = 0;
+  cacheCount = 0;
+  cacheDev = 0;
+  cacheDensity = DENS_UNKNOWN;
+  invalidateNextTrackCache();
+}
+
+static inline void swapTrackCaches() {
+  uint8_t tmpSec[MAX_SECTOR_BYTES];
+  for (uint8_t i = 0; i < MAX_PREFETCH_SECTORS; ++i) {
+    memcpy(tmpSec, cacheBuf[i], MAX_SECTOR_BYTES);
+    memcpy(cacheBuf[i], cacheNextBuf[i], MAX_SECTOR_BYTES);
+    memcpy(cacheNextBuf[i], tmpSec, MAX_SECTOR_BYTES);
+  }
+
+  uint32_t tmpMask = cacheValidMask;
+  cacheValidMask = cacheNextValidMask;
+  cacheNextValidMask = tmpMask;
+
+  uint16_t tmpStart = cacheTrackStartSec;
+  cacheTrackStartSec = cacheNextTrackStartSec;
+  cacheNextTrackStartSec = tmpStart;
+
+  uint8_t tmpSpt = cacheTrackSpt;
+  cacheTrackSpt = cacheNextTrackSpt;
+  cacheNextTrackSpt = tmpSpt;
+
+  uint8_t tmpCount = cacheCount;
+  cacheCount = cacheNextCount;
+  cacheNextCount = tmpCount;
+
+  uint8_t tmpDev = cacheDev;
+  cacheDev = cacheNextDev;
+  cacheNextDev = tmpDev;
+
+  DiskDensity tmpDensity = cacheDensity;
+  cacheDensity = cacheNextDensity;
+  cacheNextDensity = tmpDensity;
+}
+
+static inline void invalidateBootCache() {
+  bootCacheValidMask = 0;
+  bootCacheDev = 0;
+}
+
+static inline bool bootCacheHit(uint8_t devLogic, uint16_t sec) {
+  if (sec < 1 || sec > BOOT_CACHE_SECTORS) return false;
+  if (bootCacheDev != devLogic) return false;
+  uint8_t idx = (uint8_t)(sec - 1);
+  return (bootCacheValidMask & (1U << idx)) != 0;
+}
+
+static inline void bootCacheStore(uint8_t devLogic, uint16_t sec, const uint8_t* buf, int len) {
+  if (!buf || len <= 0) return;
+  if (sec < 1 || sec > BOOT_CACHE_SECTORS) return;
+  if (bootCacheDev != devLogic) {
+    invalidateBootCache();
+    bootCacheDev = devLogic;
+  }
+  uint8_t idx = (uint8_t)(sec - 1);
+  memcpy(bootCacheBuf[idx], buf, (size_t)len);
+  bootCacheValidMask |= (1U << idx);
+}
+
+static inline void preloadBootCache(uint8_t devLogic, DiskDensity mode, uint16_t sectorSize) {
+  if (bootCacheDev != devLogic) {
+    invalidateBootCache();
+    bootCacheDev = devLogic;
+  }
+  for (uint16_t s = 1; s <= BOOT_CACHE_SECTORS; ++s) {
+    uint8_t idx = (uint8_t)(s - 1);
+    if (bootCacheValidMask & (1U << idx)) continue;
+    int r = readSectorFromXFMode(devLogic, s, mode, bootCacheBuf[idx]);
+    if (r == (int)sectorSize) {
+      bootCacheValidMask |= (1U << idx);
+    }
+  }
+}
 
 // WRITE buffers
 static uint8_t  writeBuf[MAX_SECTOR_BYTES];
@@ -287,69 +399,6 @@ static uint32_t g_lastHelloMs       = 0;
 
 // FIX: Flag para suprimir HELLO durante FORMAT
 static volatile bool g_formatInProgress = false;
-
-static inline void resetReadCacheAndSequence() {
-  cacheCount = 0;
-  cacheDensity = DENS_UNKNOWN;
-  seqReadStreak = 0;
-  lastReadSec = 0;
-  lastReadDev = 0;
-  lastReadDensity = DENS_UNKNOWN;
-}
-
-static inline void resetPendingTransferState() {
-  writePending = false;
-  writeExpected = 0;
-  writeMaxEnd = 0;
-  writeChunkCount = 0;
-  writeChunkMask = 0;
-  writePendDev = 0;
-  writePendCmd = 0;
-  writePendDD = false;
-  writePendSec = 0;
-
-  percomWritePending = false;
-  percomLen = 0;
-  percomWriteDev = 0;
-}
-
-static inline void resetTransientState(const char* why, bool clearOverride) {
-  resetReadCacheAndSequence();
-  resetPendingTransferState();
-  g_formatInProgress = false;
-  g_currentDD = false;
-  if (clearOverride) clearStatusOverride();
-  (void)why;
-}
-
-static inline void mediaSoftReset(const char* why) {
-  logf("[SLAVE] Media soft reset: %s", (why && *why) ? why : "idle/new media");
-  clearStatusOverride();
-  resetReadCacheAndSequence();
-  resetPendingTransferState();
-  g_formatInProgress = false;
-  g_currentDD = false;
-  g_forceMediaProbe = true;
-  g_percomPendingValid = false;
-  g_percomPendingNeedsReadback = false;
-  g_lastPercomWriteMs = 0;
-  g_diskDensityKnown = false;
-  g_diskDensity = DENS_UNKNOWN;
-  g_diskBytesPerSector = 128;
-  g_diskSectorsPerTrack = 18;
-}
-
-static inline void maybeResetOnDiskChangeWindow(uint8_t nextCmd) {
-  uint32_t now = millis();
-  if (g_lastIoActivityMs == 0) {
-    g_lastIoActivityMs = now;
-    return;
-  }
-  bool mediaMgmtCmd = (nextCmd == 0x4E || nextCmd == 0x4F || nextCmd == 0x21 || nextCmd == 0x22 || nextCmd == 0xA1);
-  if (mediaMgmtCmd && (uint32_t)(now - g_lastIoActivityMs) > kMediaChangeIdleWindowMs) {
-    mediaSoftReset("idle/new media window");
-  }
-}
 
 // ======== DEBUG COUNTERS ========
 static uint32_t g_totalReads = 0;
@@ -835,6 +884,8 @@ int readSectorFromXFMode(uint8_t devLogical, uint16_t sec, DiskDensity mode, uin
         g_diskDensity = DENS_DD;
         g_diskDensityKnown = true;
         g_diskBytesPerSector = 256;
+      } else {
+        remember128Density(mode);
       }
       g_totalReads++;
       if (LOG_READ_OK) {
@@ -847,8 +898,12 @@ int readSectorFromXFMode(uint8_t devLogical, uint16_t sec, DiskDensity mode, uin
 
     if (mode == DENS_DD && sec > 3 && sz == 256 && readLen == 128) {
       g_ddForceActive = false;
-      logf("[XF] DD solicitado sec=%u pero llegaron 128 bytes: DD no confirmado por datos", sec);
-      resetTransientState("DD no confirmado", false);
+      g_diskDensityKnown = true;
+      g_diskDensity = g_last128Density;
+      g_diskBytesPerSector = 128;
+      g_diskSectorsPerTrack = (g_last128Density == DENS_ED) ? 26 : 18;
+      clearStatusOverride();
+      logf("[XF] DD solicitado sec=%u pero llegaron 128 bytes: DD no confirmado por datos, volviendo a %s", sec, densityName(g_last128Density));
       if (attempt < MAX_TRIES) {
         primeXf551DD(devLogical);
       }
@@ -906,6 +961,11 @@ static void primeXf551DD(uint8_t devLogical) {
 
     if (len == 128) {
       g_ddForceActive = false;
+      g_diskDensityKnown = true;
+      g_diskDensity = g_last128Density;
+      g_diskBytesPerSector = 128;
+      g_diskSectorsPerTrack = (g_last128Density == DENS_ED) ? 26 : 18;
+      clearStatusOverride();
       uint8_t st[4];
       if (xfReadStatusRaw(st, 0x00, 0x00)) {
         logf("[SLAVE] Prime DD: READ real sigue en 128 bytes (%s) status=%02X %02X %02X %02X",
@@ -921,8 +981,8 @@ static void primeXf551DD(uint8_t devLogical) {
       xfForceDDByPercom(devLogical);
     }
 
-    drainSioAdaptive(6, 1200);
-    delay(10);
+    drainSioAdaptive(4, 900);
+    delay(4);
   }
 }
 
@@ -930,12 +990,13 @@ int readSectorFromXF(uint8_t devLogical, uint16_t sec, bool dd, uint8_t* outBuf)
   return readSectorFromXFMode(devLogical, sec, dd ? DENS_DD : DENS_SD, outBuf);
 }
 
-// ✅✅✅ WRITE con verificación runtime ✅✅✅
+// ✅✅✅ WRITE con verificación runtime (base 1050c + timings RP_02) ✅✅✅
 bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
                      const uint8_t* buf, int len) {
   (void)devLogical;
 
-  int expected = (sec >= 1 && sec <= 3) ? SECTOR_128 : ((supports256 && dd) ? SECTOR_256 : SECTOR_128);
+  int expected = (int)expectedSectorSizeForMode(dd ? DENS_DD : hostVisibleDensity(), sec);
+  if (!dd && expected > 128) expected = 128;
 
   uint8_t frame[5];
   frame[0] = g_physicalDev;
@@ -976,7 +1037,6 @@ bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
       continue;
     }
 
-    // ✅ DECIDE SI VERIFICAR (runtime)
     bool doVerify = false;
     if (g_verifyAllWrites) {
       doVerify = true;
@@ -986,11 +1046,13 @@ bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
       if (g_verifyVtocDir && (sec >= 360 && sec <= 368)) doVerify = true;
     }
 
+    DiskDensity logMode = dd ? (g_ddForceActive ? DENS_DD : hostVisibleDensity()) : hostVisibleDensity();
+
     if (doVerify) {
       delay(20);
 
       uint8_t rb[MAX_SECTOR_BYTES];
-      DiskDensity verifyMode = dd ? DENS_DD : (g_diskDensityKnown ? g_diskDensity : DENS_SD);
+      DiskDensity verifyMode = dd ? DENS_DD : logMode;
       int r = readSectorFromXFMode(devLogical, sec, verifyMode, rb);
 
       if (r != expected) {
@@ -1027,13 +1089,11 @@ bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
         return false;
       }
 
-      DiskDensity verifyLogMode = dd ? DENS_DD : hostVisibleDensity();
       logf("[SLAVE D%u] ✅ VERIFY OK sec=%u (%s)",
-           (unsigned)(g_lastLogicDev - 0x30), sec, densityName(verifyLogMode));
+           (unsigned)(g_lastLogicDev - 0x30), sec, densityName(logMode));
     }
 
     g_totalWrites++;
-    DiskDensity logMode = dd ? DENS_DD : hostVisibleDensity();
     logf("[SLAVE D%u] ✅ WRITE OK sec=%u (%s) primeros: %02X %02X %02X %02X",
          (unsigned)(g_lastLogicDev - 0x30), sec, densityName(logMode),
          tmp[0], tmp[1], tmp[2], tmp[3]);
@@ -1068,22 +1128,6 @@ bool readPercomFromXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, uint8_t* o
   return true;
 }
 
-static inline uint16_t percomBytesPerSector(const uint8_t* p) {
-  uint16_t bps = ((uint16_t)p[6] << 8) | (uint16_t)p[7];
-  if (bps == 0) bps = 128;
-  return bps;
-}
-
-static inline uint16_t percomSectorsPerTrack(const uint8_t* p) {
-  uint16_t spt = ((uint16_t)p[2] << 8) | (uint16_t)p[3];
-  if (spt == 0) spt = 18;
-  return spt;
-}
-
-static inline uint8_t percomSides(const uint8_t* p) {
-  return (uint8_t)((p[4] & 0x01) ? 2 : 1);
-}
-
 static inline const char* percomModeName(const uint8_t* p) {
   uint16_t spt = percomSectorsPerTrack(p);
   uint16_t bps = percomBytesPerSector(p);
@@ -1093,6 +1137,36 @@ static inline const char* percomModeName(const uint8_t* p) {
   if (bps == 256 && sides >= 2) return "DSDD";
   if (bps == 256) return "SSDD";
   return "SD";
+}
+
+
+static bool sanitizePercomForDos25(uint8_t* p) {
+  uint16_t bps = percomBytesPerSector(p);
+  uint16_t spt = percomSectorsPerTrack(p);
+  uint8_t sides = percomSides(p);
+
+  // Para unidades tipo XF551/compatibles con 256 bytes por sector,
+  // preservar el PERCOM 128/18/2 (MyDOS 4.55 lo usa para formatos DD/DS)
+  // y NO degradarlo a ED. La sanitización a 26x128 aplica solo a rutas 1050.
+  if (supports256 && bps == 128 && spt == 18 && sides == 2) {
+    logf("[XF] WRITE PERCOM 128/18/2 preservado para MyDOS/XF551 (sin saneo a ED)");
+    return false;
+  }
+
+  // Flujo observado de DOS 2.5/1050: PERCOM 128/18/2 que termina
+  // arrastrando un FORMAT SD. Lo saneamos a 1050 ED (40x26x128, una cara).
+  if (!supports256 && bps == 128 && spt == 18 && sides == 2) {
+    p[0] = 40;                  // tracks
+    p[1] = 0x04;                // step rate / reservado
+    p[2] = 0x00; p[3] = 0x1A;   // 26 sectors por pista
+    p[4] = 0x00;                // 1 cara
+    p[5] = 0x00;                // density code compatible 128-byte
+    p[6] = 0x00; p[7] = 0x80;   // 128 bytes/sector
+    logf("[1050] WRITE PERCOM saneado a ED: bps=128 spt=26 sides=1");
+    return true;
+  }
+
+  return false;
 }
 
 static inline bool percomUses256(const uint8_t* p) {
@@ -1194,6 +1268,7 @@ bool autoDetectDiskDensity() {
   g_diskSectorsPerTrack = geom.sectorsPerTrack;
   g_diskDensity         = geom.density;
   g_diskDensityKnown    = (geom.density != DENS_UNKNOWN);
+  remember128Density(geom.density);
   g_ddForceActive       = false;
 
   if (geom.density == DENS_DD) {
@@ -1213,7 +1288,7 @@ bool getDiskDD() {
   if (!g_diskDensityKnown) {
     autoDetectDiskDensity();
   }
-  return (g_diskDensity == DENS_DD);
+  return g_ddForceActive;
 }
 
 static void xfDiagProbeSector(uint8_t devLogical, uint16_t sec, DiskDensity mode) {
@@ -1310,18 +1385,23 @@ void resetDiskDetection() {
   g_diskSectorsPerTrack = 18;
   g_ddForceActive = false;
   g_lastDdForceMs = 0;
+  g_last128Density = DENS_SD;
+  clearStatusOverride();
   logf("[SLAVE] Detección de densidad reseteada");
 }
 
 bool writePercomToXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, const uint8_t* buf, int len) {
   (void)devLogical;
+  // Mantener compatibilidad XF551: enviar WRITE PERCOM con AUX=0/0 a la unidad física.
+  (void)aux1;
+  (void)aux2;
 
   uint8_t tmp[PERCOM_BLOCK_LEN];
   memset(tmp, 0, sizeof(tmp));
   if (len > PERCOM_BLOCK_LEN) len = PERCOM_BLOCK_LEN;
   memcpy(tmp, buf, len);
 
-  uint8_t frame[5] = { g_physicalDev, 0x4F, aux1, aux2, 0x00 };
+  uint8_t frame[5] = { g_physicalDev, 0x4F, 0x00, 0x00, 0x00 };
   frame[4] = sioChecksum(frame, 4);
 
   pulseCommandAndSendFrame(frame);
@@ -1369,14 +1449,17 @@ void sendSectorChunk(uint16_t sec, const uint8_t* buf, int len) {
 
 void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCount) {
   g_lastLogicDev = devLogic;
-    resetPendingTransferState();
+  writePending = false;
+  percomWritePending = false;
 
   DiskDensity startMode = dd ? DENS_DD : DENS_SD;
   if (g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) {
     startMode = g_diskDensity;
   }
 
-  if (!dd && sec > 3 && (!g_diskDensityKnown || g_diskDensity == DENS_SD)) {
+  // v18: densidad sticky por unidad/sesión.
+  // Solo autodetectar si realmente aún no conocemos la densidad.
+  if (!dd && sec > 3 && !g_diskDensityKnown) {
     autoDetectDiskDensity();
     if (g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) {
       startMode = g_diskDensity;
@@ -1387,31 +1470,64 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
   int sz = (int)expectedSectorSizeForMode(startMode, sec);
   bool servedFromCache = false;
 
-  if (cacheCount > 0 &&
+  if (bootCacheHit(devLogic, sec)) {
+    memcpy(buf, bootCacheBuf[sec - 1], sz);
+    servedFromCache = true;
+    if (LOG_CACHE_HIT) logf("[CACHE] ✅ Boot hit sec=%u", sec);
+    if (LOG_CACHE_DIAG) logf("[CACHE-DIAG] BOOT HIT dev=D%u sec=%u size=%d", (unsigned)(devLogic - 0x30), (unsigned)sec, sz);
+  }
+
+  uint16_t reqTrackStart = trackStartForSector(sec, startMode);
+  uint8_t  reqTrackSpt   = (sec <= 3) ? 1 : (uint8_t)sectorsPerTrackForDensity(startMode);
+  uint8_t  reqTrackIdx   = sectorIndexInTrack(sec, startMode);
+
+  if (!servedFromCache && cacheCount > 0 &&
       cacheDev == devLogic &&
       cacheDensity == startMode &&
-      sec >= cacheFirstSec &&
-      sec < (uint16_t)(cacheFirstSec + cacheCount)) {
-    uint8_t idx = (uint8_t)(sec - cacheFirstSec);
-    memcpy(buf, cacheBuf[idx], sz);
+      cacheTrackStartSec == reqTrackStart &&
+      cacheTrackSpt == reqTrackSpt &&
+      (cacheValidMask & (1UL << reqTrackIdx))) {
+    memcpy(buf, cacheBuf[reqTrackIdx], sz);
     servedFromCache = true;
-    if (LOG_CACHE_HIT) logf("[CACHE] ✅ Hit sec=%u (%s)", sec, densityName(startMode));
+    if (LOG_CACHE_HIT) logf("[CACHE] ✅ Track hit sec=%u (%s)", sec, densityName(startMode));
+    if (LOG_CACHE_DIAG) logf("[CACHE-DIAG] TRACK HIT dev=D%u sec=%u start=%u idx=%u valid=%u/%u dens=%s", (unsigned)(devLogic - 0x30), (unsigned)sec, (unsigned)reqTrackStart, (unsigned)reqTrackIdx, (unsigned)cacheCount, (unsigned)cacheTrackSpt, densityName(startMode));
+  } else if (!servedFromCache && cacheNextCount > 0 &&
+             cacheNextDev == devLogic &&
+             cacheNextDensity == startMode &&
+             cacheNextTrackStartSec == reqTrackStart &&
+             cacheNextTrackSpt == reqTrackSpt &&
+             (cacheNextValidMask & (1UL << reqTrackIdx))) {
+    memcpy(buf, cacheNextBuf[reqTrackIdx], sz);
+    servedFromCache = true;
+    swapTrackCaches(); // promover la pista siguiente a pista actual al primer hit real
+    if (LOG_CACHE_HIT) logf("[CACHE] ✅ Next-track hit sec=%u (%s)", sec, densityName(startMode));
+    if (LOG_CACHE_DIAG) logf("[CACHE-DIAG] NEXT HIT dev=D%u sec=%u start=%u idx=%u nextValid=%u/%u dens=%s", (unsigned)(devLogic - 0x30), (unsigned)sec, (unsigned)reqTrackStart, (unsigned)reqTrackIdx, (unsigned)cacheCount, (unsigned)cacheTrackSpt, densityName(startMode));
   }
 
   if (!servedFromCache) {
+    if (LOG_CACHE_DIAG) {
+      logf("[CACHE-DIAG] MISS dev=D%u sec=%u start=%u idx=%u dens=%s boot=%u track=%u/%u next=%u/%u",
+           (unsigned)(devLogic - 0x30),
+           (unsigned)sec,
+           (unsigned)reqTrackStart,
+           (unsigned)reqTrackIdx,
+           densityName(startMode),
+           (unsigned)bootCacheHit(devLogic, sec),
+           (unsigned)cacheCount,
+           (unsigned)cacheTrackSpt,
+           (unsigned)cacheNextCount,
+           (unsigned)cacheNextTrackSpt);
+    }
     DiskDensity candidates[3] = { DENS_UNKNOWN, DENS_UNKNOWN, DENS_UNKNOWN };
 
     if (g_ddForceActive && sec > 3) {
       candidates[0] = DENS_DD;
     }
     else if (sec > 3 && g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) {
-      // Geometría ya conocida: NO cruzar entre SD/ED/DD
       candidates[0] = g_diskDensity;
     }
     else {
-      // Solo cuando todavía no sabemos la geometría real
       candidates[0] = startMode;
-
       if (startMode == DENS_SD) {
         candidates[1] = DENS_ED;
         candidates[2] = DENS_DD;
@@ -1452,21 +1568,13 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
       }
     }
 
-    if (r <= 0) {
+    if (r <= 0 || usedMode == DENS_UNKNOWN) {
       sendNAK();
-      cacheCount = 0;
-      cacheDensity = DENS_UNKNOWN;
+      resetTrackCache();
       return;
     }
 
     sz = r;
-    if (usedMode == DENS_UNKNOWN) {
-      sendNAK();
-      cacheCount = 0;
-      cacheDensity = DENS_UNKNOWN;
-      return;
-    }
-
     g_diskDensityKnown = true;
     g_diskDensity = usedMode;
     g_diskBytesPerSector = expectedSectorSizeForMode(usedMode, sec);
@@ -1476,6 +1584,23 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
     } else if (usedMode != DENS_DD) {
       g_ddForceActive = false;
     }
+
+    reqTrackStart = trackStartForSector(sec, usedMode);
+    reqTrackSpt   = (sec <= 3) ? 1 : (uint8_t)sectorsPerTrackForDensity(usedMode);
+    reqTrackIdx   = sectorIndexInTrack(sec, usedMode);
+    if (LOG_CACHE_DIAG) {
+      logf("[CACHE-DIAG] PHYS READ dev=D%u sec=%u dens=%s size=%d start=%u idx=%u",
+           (unsigned)(devLogic - 0x30),
+           (unsigned)sec,
+           densityName(usedMode),
+           sz,
+           (unsigned)reqTrackStart,
+           (unsigned)reqTrackIdx);
+    }
+  }
+
+  if (sec <= BOOT_CACHE_SECTORS) {
+    bootCacheStore(devLogic, sec, buf, sz);
   }
 
   sendACK();
@@ -1493,62 +1618,106 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
 
   uint8_t effectivePf = pfCount;
   if (effectivePf == 0 && g_diskDensityKnown) {
-    uint8_t trackRemain = sectorsRemainingInTrack(sec, g_diskDensity);
-    if (seqReadStreak >= 1) {
-      effectivePf = trackRemain;
+    if (sec <= BOOT_CACHE_SECTORS) {
+      effectivePf = BOOT_CACHE_SECTORS;
     } else {
-      uint8_t autoExtra = AUTO_READAHEAD_EXTRA;
-      effectivePf = (autoExtra > 0) ? (uint8_t)(1 + autoExtra) : 1;
-      if (trackRemain > 0 && effectivePf > trackRemain) effectivePf = trackRemain;
+      // v18: micro-burst conservador dentro de la misma pista.
+      // Sin precarga de pista siguiente.
+      effectivePf = TRACK_BURST_SECTORS;
     }
   }
+
   if (effectivePf == 0) {
-    cacheCount = 0;
-    cacheDensity = DENS_UNKNOWN;
+    resetTrackCache();
     return;
   }
   if (effectivePf > MAX_PREFETCH_SECTORS) effectivePf = MAX_PREFETCH_SECTORS;
 
-  uint8_t reused = 0;
-  if (servedFromCache && cacheCount > 0 &&
-      cacheDev == devLogic && cacheDensity == g_diskDensity &&
-      sec >= cacheFirstSec && sec < (uint16_t)(cacheFirstSec + cacheCount)) {
-    uint8_t idx = (uint8_t)(sec - cacheFirstSec);
-    reused = (uint8_t)(cacheCount - idx);
-    if (reused > MAX_PREFETCH_SECTORS) reused = MAX_PREFETCH_SECTORS;
+  if (sec <= BOOT_CACHE_SECTORS) {
+    preloadBootCache(devLogic, g_diskDensity, (uint16_t)sz);
+    lastReadSec = sec;
+    lastReadDev = devLogic;
+    lastReadDensity = g_diskDensity;
+    return;
+  }
 
-    memcpy(cacheBuf[0], buf, sz);
-    for (uint8_t k = 1; k < reused; k++) {
-      memcpy(cacheBuf[k], cacheBuf[idx + k], sz);
+  // Preparar/retener caché por pista actual
+  if (cacheCount == 0 ||
+      cacheDev != devLogic ||
+      cacheDensity != g_diskDensity ||
+      cacheTrackStartSec != reqTrackStart ||
+      cacheTrackSpt != reqTrackSpt) {
+    if (LOG_CACHE_DIAG) {
+      logf("[CACHE-DIAG] CACHE RESET->TRACK dev=D%u sec=%u newStart=%u newSpt=%u dens=%s oldStart=%u oldValid=%u/%u",
+           (unsigned)(devLogic - 0x30),
+           (unsigned)sec,
+           (unsigned)reqTrackStart,
+           (unsigned)reqTrackSpt,
+           densityName(g_diskDensity),
+           (unsigned)cacheTrackStartSec,
+           (unsigned)cacheCount,
+           (unsigned)cacheTrackSpt);
+    }
+    resetTrackCache();
+    cacheDev = devLogic;
+    cacheDensity = g_diskDensity;
+    cacheTrackStartSec = reqTrackStart;
+    cacheTrackSpt = reqTrackSpt;
+  }
+
+  // Guardar siempre el sector actual en su índice de pista
+  if ((cacheValidMask & (1UL << reqTrackIdx)) == 0) {
+    cacheCount++;
+    cacheValidMask |= (1UL << reqTrackIdx);
+  }
+  memcpy(cacheBuf[reqTrackIdx], buf, sz);
+
+  uint8_t loadedThisPass = 1;
+  for (uint8_t i = 1; i < effectivePf; i++) {
+    uint16_t nextSec = (uint16_t)(sec + i);
+    if (trackStartForSector(nextSec, g_diskDensity) != reqTrackStart) break;
+
+    uint8_t nextIdx = sectorIndexInTrack(nextSec, g_diskDensity);
+    if (cacheValidMask & (1UL << nextIdx)) {
+      loadedThisPass++;
+      continue;
     }
 
-    cacheFirstSec = sec;
-    cacheDev      = devLogic;
-    cacheDensity  = g_diskDensity;
-    cacheCount    = reused;
-  } else {
-    memcpy(cacheBuf[0], buf, sz);
-    cacheFirstSec = sec;
-    cacheDev      = devLogic;
-    cacheDensity  = g_diskDensity;
-    cacheCount    = 1;
-  }
-
-  for (uint8_t i = cacheCount; i < effectivePf; i++) {
-    uint16_t nextSec = sec + i;
-    int r = readSectorFromXFMode(devLogic, nextSec, g_diskDensity, cacheBuf[i]);
+    int r = readSectorFromXFMode(devLogic, nextSec, g_diskDensity, cacheBuf[nextIdx]);
     if (r != sz) break;
+
+    cacheValidMask |= (1UL << nextIdx);
     cacheCount++;
+    loadedThisPass++;
   }
 
-  if (cacheCount > 1 && LOG_PREFETCH) {
-    logf("[CACHE] Prefetch %u sectores desde %u (%s)%s%s%s%s",
-         cacheCount, sec, densityName(g_diskDensity),
+  if (LOG_CACHE_DIAG) {
+    bool wholeTrack = (cacheTrackSpt > 0 && cacheCount >= cacheTrackSpt);
+    logf("[CACHE-DIAG] FILL dev=D%u sec=%u start=%u idx=%u loaded=%u valid=%u/%u dens=%s%s",
+         (unsigned)(devLogic - 0x30),
+         (unsigned)sec,
+         (unsigned)cacheTrackStartSec,
+         (unsigned)reqTrackIdx,
+         (unsigned)loadedThisPass,
+         (unsigned)cacheCount,
+         (unsigned)cacheTrackSpt,
+         densityName(g_diskDensity),
+         (wholeTrack ? " [full-track]" : ""));
+  } else if (cacheCount > 1 && LOG_PREFETCH) {
+    bool wholeTrack = (cacheTrackSpt > 0 && cacheCount >= cacheTrackSpt);
+    logf("[CACHE] Track cache: valid=%u/%u start=%u from=%u (%s)%s%s%s",
+         cacheCount,
+         cacheTrackSpt,
+         cacheTrackStartSec,
+         sec,
+         densityName(g_diskDensity),
          (pfCount == 0 ? " [auto]" : ""),
-         (reused > 1 ? " [reuse]" : ""),
          (seqReadStreak >= 1 ? " [seq]" : ""),
-         (cacheCount >= sectorsRemainingInTrack(sec, g_diskDensity) ? " [track]" : ""));
+         (wholeTrack ? " [full-track]" : ""));
   }
+
+  // v16: preload automático de pista siguiente desactivado para evitar picos dobles.
+  invalidateNextTrackCache();
 
   lastReadSec = sec;
   lastReadDev = devLogic;
@@ -1557,9 +1726,17 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
 
 void handleStatusFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2, bool dd) {
   g_lastLogicDev = devLogic;
+  // v16: limpiar caches/estado secuencial en comandos especiales para evitar contaminación D1/D2
+  resetTrackCache();
+  invalidateBootCache();
+  seqReadStreak = 0;
+  lastReadSec = 0;
+  lastReadDev = 0;
+  lastReadDensity = DENS_UNKNOWN;
   (void)dd;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
-  resetPendingTransferState();
+writePending = false;
+  percomWritePending = false;
 
   if (statusOverrideIsActive()) {
     sendACK();
@@ -1582,17 +1759,17 @@ void handleStatusFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2, bool d
 
   DiskDensity visible = hostVisibleDensity();
   if (visible == DENS_ED) {
-    st[0] = 0x80;
-    st[1] = 0xFF;
+    st[0] |= 0x80;
     st[2] = 0xE0;
     st[3] = 0x00;
-    logf("[1050] STATUS normalizado a ED: %02X %02X %02X %02X", st[0], st[1], st[2], st[3]);
+    logf("[1050] STATUS normalizado a ED: %02X %02X %02X %02X",
+         st[0], st[1], st[2], st[3]);
   } else if (visible == DENS_DD) {
-    st[0] = 0x20;
-    st[1] = 0xFF;
+    st[0] &= (uint8_t)~0x80;
     st[2] = 0xFE;
     st[3] = 0x00;
-    logf("[XF] STATUS normalizado a DD: %02X %02X %02X %02X", st[0], st[1], st[2], st[3]);
+    logf("[XF] STATUS normalizado a DD confirmado: %02X %02X %02X %02X",
+         st[0], st[1], st[2], st[3]);
   }
 
   sendACK();
@@ -1619,16 +1796,20 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
 
   unsigned long timeout = (formatReplyLen >= 256) ? 360000UL : 150000UL;
 
-  logf("[XF] FORMAT iniciando cmd=0x%02X base=0x%02X isDD=%d pending=%d replyLen=%d",
-       cmd, base, isDD ? 1 : 0, g_percomPendingValid ? 1 : 0, formatReplyLen);
+  bool skewHs = (cmd == 0xA1);
+  logf("[XF] FORMAT iniciando cmd=0x%02X base=0x%02X skewHS=%d isDD=%d pending=%d replyLen=%d",
+       cmd, base, skewHs ? 1 : 0, isDD ? 1 : 0, g_percomPendingValid ? 1 : 0, formatReplyLen);
 
   drainSio(100);
 
   uint8_t frame[5];
   frame[0] = g_physicalDev;
   frame[1] = cmd;
-  frame[2] = aux1;
-  frame[3] = aux2;
+  // XF551: al invocar FORMAT conviene usar AUX1/AUX2 en cero hacia el drive real.
+  (void)aux1;
+  (void)aux2;
+  frame[2] = 0x00;
+  frame[3] = 0x00;
   frame[4] = sioChecksum(frame, 4);
 
   pulseCommandAndSendFrame(frame);
@@ -1636,7 +1817,6 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
   if (!waitByte(SIO_ACK, 5000)) {
     logf("[XF] FORMAT: No ACK de XF551");
     g_formatInProgress = false;
-    resetTransientState("FORMAT sin ACK", true);
     sendNAK();
     return;
   }
@@ -1659,26 +1839,24 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
       } else if (b == SIO_ERROR || b == SIO_NAK) {
         logf("[XF] FORMAT: ERROR/NAK 0x%02X", b);
         g_formatInProgress = false;
-        resetTransientState("FORMAT ERROR/NAK", true);
         sendNAK();
         return;
       }
     }
 
     if (gotComplete) break;
-    delay(50);
+    delay(10);
     yield();
   }
 
   if (!gotComplete) {
     logf("[XF] FORMAT: Timeout");
     g_formatInProgress = false;
-    resetTransientState("FORMAT timeout", true);
     sendNAK();
     return;
   }
 
-  delay(100);
+  delay(20);
   while (SerialSIO.available()) {
     SerialSIO.read();
   }
@@ -1687,7 +1865,12 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
   memset(buf, 0xFF, sizeof(buf));
 
   g_formatInProgress = false;
-  resetTransientState("FORMAT OK", false);
+  resetTrackCache();
+  invalidateBootCache();
+  seqReadStreak = 0;
+  lastReadSec = 0;
+  lastReadDev = 0;
+  lastReadDensity = DENS_UNKNOWN;
   resetDiskDetection();
 
   if (g_percomPendingValid) {
@@ -1719,13 +1902,15 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
 void handleFormatSD(uint8_t devLogic, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   g_lastLogicDev = devLogic;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
-  resetPendingTransferState();
+writePending = false;
+  percomWritePending = false;
   formatXF(cmd, aux1, aux2, false);  // SD
 }
 void handleFormatDD(uint8_t devLogic, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
   g_lastLogicDev = devLogic;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
-  resetPendingTransferState();
+writePending = false;
+  percomWritePending = false;
   formatXF(cmd, aux1, aux2, true);   // DD
 }
 
@@ -1733,7 +1918,7 @@ void handleWriteFromMaster(uint8_t devLogic, uint8_t cmd, uint16_t sec, bool dd)
   g_lastLogicDev = devLogic;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
 // AUTO-DETECCIÓN: Si el Master dice SD pero detectamos DD, usar DD
-  if (!dd && g_diskDensityKnown && g_diskDensity == DENS_DD) {
+  if (!dd && g_ddForceActive) {
     dd = true;
     logf("[SLAVE] WRITE: Corrigiendo SD->DD (disco detectado como DD)");
   }
@@ -1751,11 +1936,23 @@ void handleWriteFromMaster(uint8_t devLogic, uint8_t cmd, uint16_t sec, bool dd)
 
   writeExpected = (int)expectedSectorSizeForDensity(dd, sec);
 
-  resetReadCacheAndSequence();
+  resetTrackCache();
+  invalidateBootCache();
+  seqReadStreak = 0;
+  lastReadSec = 0;
+  lastReadDev = 0;
+  lastReadDensity = DENS_UNKNOWN;
 }
 
 void handleReadPercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
   g_lastLogicDev = devLogic;
+  // v16: limpiar caches/estado secuencial en comandos especiales para evitar contaminación D1/D2
+  resetTrackCache();
+  invalidateBootCache();
+  seqReadStreak = 0;
+  lastReadSec = 0;
+  lastReadDev = 0;
+  lastReadDensity = DENS_UNKNOWN;
   uint8_t buf[PERCOM_BLOCK_LEN];
   memset(buf, 0, sizeof(buf));
 
@@ -1770,6 +1967,7 @@ void handleReadPercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
     g_diskSectorsPerTrack = spt;
     g_diskDensity         = (bps >= 256) ? DENS_DD : ((spt == 26) ? DENS_ED : DENS_SD);
     g_diskDensityKnown    = true;
+    remember128Density(g_diskDensity);
 
     logf("[SLAVE] READ PERCOM -> devolviendo PENDIENTE: mode=%s bps=%u spt=%u sides=%u",
          percomModeName(buf), (unsigned)bps, (unsigned)spt, (unsigned)sides);
@@ -1804,6 +2002,13 @@ void handleReadPercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
 
 void handleWritePercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
   g_lastLogicDev = devLogic;
+  // v16: limpiar caches/estado secuencial en comandos especiales para evitar contaminación D1/D2
+  resetTrackCache();
+  invalidateBootCache();
+  seqReadStreak = 0;
+  lastReadSec = 0;
+  lastReadDev = 0;
+  lastReadDensity = DENS_UNKNOWN;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
   percomWritePending = true;
   percomWriteDev     = devLogic;
@@ -1813,8 +2018,8 @@ void handleWritePercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
   g_percomAux2 = aux2;
 
   memset(percomWriteBuf, 0, sizeof(percomWriteBuf));
-  cacheCount = 0;
-  cacheDensity = DENS_UNKNOWN;
+  resetTrackCache();
+  invalidateBootCache();
   seqReadStreak = 0;
   lastReadSec = 0;
   lastReadDev = 0;
@@ -1853,6 +2058,20 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
       writeChunkMask  = 0;
       writeMaxEnd     = 0;
     } else if (count != writeChunkCount) {
+      sendNAK();
+      writePending = false;
+      return;
+    }
+
+    if (idx >= count) {
+      sendNAK();
+      writePending = false;
+      return;
+    }
+
+    int expectedChunks = (writeExpected + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+    if (count != expectedChunks) {
+      logf("[SLAVE] ❌ WRITE chunkCount inválido: count=%u esperado=%d", count, expectedChunks);
       sendNAK();
       writePending = false;
       return;
@@ -1902,6 +2121,19 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
       return;
     }
 
+    if (idx >= count) {
+      sendNAK();
+      percomWritePending = false;
+      return;
+    }
+
+    int expectedChunks = (PERCOM_BLOCK_LEN + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD;
+    if (count != expectedChunks) {
+      sendNAK();
+      percomWritePending = false;
+      return;
+    }
+
     int off = (int)idx * (int)CHUNK_PAYLOAD;
     if (off < 0 || off >= PERCOM_BLOCK_LEN) {
       sendNAK();
@@ -1924,16 +2156,42 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     bool last = (idx + 1 >= count);
     if (!last) return;
 
-    bool ok = writePercomToXF(percomWriteDev, g_percomAux1, g_percomAux2, percomWriteBuf, percomLen);
+    uint8_t percomApplied[PERCOM_BLOCK_LEN];
+    memset(percomApplied, 0, sizeof(percomApplied));
+    memcpy(percomApplied, percomWriteBuf, min(percomLen, PERCOM_BLOCK_LEN));
+
+    // DOS 2.5/1050: sanear ANTES de escribirlo a la unidad física.
+    sanitizePercomForDos25(percomApplied);
+
+    uint8_t currentPercom[PERCOM_BLOCK_LEN];
+    bool haveCurrentPercom = readPercomFromXF(percomWriteDev, g_percomAux1, g_percomAux2, currentPercom);
+
+    uint16_t reqBps   = percomBytesPerSector(percomApplied);
+    uint16_t reqSpt   = percomSectorsPerTrack(percomApplied);
+    uint8_t  reqSides = percomSides(percomApplied);
+
+    bool sameCanonicalSD =
+      haveCurrentPercom &&
+      (reqBps == 128) && (reqSpt == 18) && (reqSides == 1) &&
+      (percomBytesPerSector(currentPercom) == 128) &&
+      (percomSectorsPerTrack(currentPercom) == 18) &&
+      (percomSides(currentPercom) == 1);
+
+    if (sameCanonicalSD) {
+      logf("[SLAVE] WRITE PERCOM redundante detectado, pero se reenvía igual al XF551 para preparar FORMAT");
+    }
+
+    bool ok = writePercomToXF(percomWriteDev, 0x00, 0x00,
+                              percomApplied, PERCOM_BLOCK_LEN);
 
     if (!ok) {
-      resetTransientState("WRITE PERCOM FAIL", true);
+      percomWritePending = false;
       sendNAK();
       return;
     }
 
     memset(g_percomPendingBlock, 0, sizeof(g_percomPendingBlock));
-    memcpy(g_percomPendingBlock, percomWriteBuf, min(percomLen, PERCOM_BLOCK_LEN));
+    memcpy(g_percomPendingBlock, percomApplied, PERCOM_BLOCK_LEN);
     g_percomPendingValid = true;
     g_percomPendingCmd = 0x4F;
     g_lastPercomWriteMs = millis();
@@ -1951,8 +2209,11 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     g_diskSectorsPerTrack = spt;
     g_diskDensity         = (bps >= 256) ? DENS_DD : ((spt == 26) ? DENS_ED : DENS_SD);
     g_diskDensityKnown    = true;
+    if (g_diskDensity != DENS_DD) remember128Density(g_diskDensity);
+    g_ddForceActive = false;
+    clearStatusOverride();
 
-    resetTransientState("WRITE PERCOM OK", true);
+    percomWritePending = false;
 
     sendACK();
     sendSectorChunk(PERCOM_SEC_MAGIC, g_percomPendingBlock, PERCOM_BLOCK_LEN);
@@ -2007,22 +2268,17 @@ static void processIncomingPacket(const uint8_t* src, const uint8_t* in, int len
   uint8_t type = in[0];
 
   if (type == TYPE_CFG_UPDATE) {
-    markIoActivity();
-    resetTransientState("CFG UPDATE", true);
     handleCfgUpdate(in, len);
     return;
   }
 
   if (type == TYPE_SECTOR_CHUNK && len >= 6) {
-    markIoActivity();
     handleSectorChunkFromMaster(in, len);
     return;
   }
 
   if (type == TYPE_CMD_FRAME && len >= 6) {
     uint8_t cmd  = in[1];
-    maybeResetOnDiskChangeWindow(cmd);
-    markIoActivity();
     uint8_t dev  = in[2];
     uint8_t aux1 = in[3];
     uint8_t aux2 = in[4];
@@ -2165,13 +2421,14 @@ void setup() {
   g_lastHelloMs = millis();
   g_lastNetActivityMs = millis();
 
-  cacheCount = 0;
-  cacheDensity = DENS_UNKNOWN;
+  resetTrackCache();
+  invalidateBootCache();
   seqReadStreak = 0;
   lastReadSec = 0;
   lastReadDev = 0;
   lastReadDensity = DENS_UNKNOWN;
-    resetPendingTransferState();
+  writePending = false;
+  percomWritePending = false;
 
   markActivity();
   logf("[SLAVE] ✅ Listo. Esperando comandos... (Serial: X=diag densidad, S=stats)");

@@ -54,10 +54,10 @@ const int LED_STATUS = LED_BUILTIN;
 static const uint16_t CHUNK_PAYLOAD = 240;
 
 // Timings SIO - OPTIMIZADOS
-uint16_t T_ACK_TO_COMPLETE   = 120;
-uint16_t T_COMPLETE_TO_DATA  = 80;
-uint16_t T_DATA_TO_CHK       = 15;
-uint16_t T_CHUNK_DELAY       = 20;
+uint16_t T_ACK_TO_COMPLETE   = 300;
+uint16_t T_COMPLETE_TO_DATA  = 250;
+uint16_t T_DATA_TO_CHK       = 50;
+uint16_t T_CHUNK_DELAY       = 100;
 
 bool lastCmdState = HIGH;
 uint8_t cmdBuf[5];
@@ -117,12 +117,8 @@ static volatile int      g_readExpectedLen = 0;
 // FORMAT remoto
 static volatile bool     g_formatDone      = false;
 static volatile bool     g_formatSuccess   = false;
-static uint8_t           g_formatBuf[256];
+static uint8_t           g_formatBuf[128];
 static volatile int      g_formatLen       = 0;
-static volatile bool     g_formatStarted     = false;
-static volatile uint8_t  g_formatChunkCount  = 0;
-static volatile uint32_t g_formatChunkMask32 = 0;
-static volatile uint32_t g_formatLastChunkMs = 0;
 
 // PERCOM remoto
 static volatile bool     g_percomDone      = false;
@@ -380,10 +376,10 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
         return v;
       };
 
-      T_ACK_TO_COMPLETE  = clamp16(ack2comp,   60, 5000);
-      T_COMPLETE_TO_DATA = clamp16(comp2data,  40, 5000);
-      T_DATA_TO_CHK      = clamp16(data2chk,   10, 2000);
-      T_CHUNK_DELAY      = clamp16(chDelay,     0, 8000);
+      T_ACK_TO_COMPLETE  = clamp16(ack2comp,  200, 5000);
+      T_COMPLETE_TO_DATA = clamp16(comp2data, 200, 5000);
+      T_DATA_TO_CHK      = clamp16(data2chk,   20, 2000);
+      T_CHUNK_DELAY      = clamp16(chDelay,   100, 8000);
 
       Serial.print(F("[RP2040] TIMINGS desde MASTER -> "));
       Serial.print(F("ack2comp="));  Serial.print(T_ACK_TO_COMPLETE);
@@ -525,44 +521,17 @@ void onMasterFrame(uint8_t type, const uint8_t *data, uint8_t len) {
 
       // FORMAT
       if (g_currentOp == OP_FORMAT && sec == 0) {
-        if (!g_formatStarted) {
-          g_formatStarted     = true;
-          g_formatChunkCount  = (count == 0) ? 1 : count;
-          g_formatChunkMask32 = 0;
-          g_formatLen         = 0;
-          g_formatLastChunkMs = millis();
-          memset(g_formatBuf, 0, sizeof(g_formatBuf));
+        int copyLen = (dlen > (int)sizeof(g_formatBuf)) ? (int)sizeof(g_formatBuf) : dlen;
+        memcpy(g_formatBuf, payload, copyLen);
+        g_formatLen      = copyLen;
+        g_formatDone     = true;
+        g_formatSuccess  = (copyLen > 0);
+        mb();
+        g_currentOp      = OP_NONE;
 
-          Serial.print(F("[RP2040] FORMAT iniciado esperando "));
-          Serial.print((int)g_formatChunkCount);
-          Serial.println(F(" chunks"));
-        }
-
-        int off = (int)idx * (int)CHUNK_PAYLOAD;
-        if (off < 0) off = 0;
-        if (off >= (int)sizeof(g_formatBuf)) off = (int)sizeof(g_formatBuf);
-
-        int room = (int)sizeof(g_formatBuf) - off;
-        if (dlen > room) dlen = room;
-        if (dlen > 0) memcpy(g_formatBuf + off, payload, dlen);
-
-        int endPos = off + dlen;
-        if (endPos > g_formatLen) g_formatLen = endPos;
-
-        if (idx < 32) {
-          uint32_t bit = (1UL << idx);
-          g_formatChunkMask32 |= bit;
-        }
-
-        g_formatLastChunkMs = millis();
-
-        uint32_t need = fullMask32(g_formatChunkCount);
-        if (need != 0 && ((g_formatChunkMask32 & need) == need)) {
-          g_formatDone    = true;
-          g_formatSuccess = (g_formatLen > 0);
-          mb();
-          g_currentOp     = OP_NONE;
-
+        if (!g_formatSuccess) {
+          Serial.println(F("[RP2040] FORMAT: longitud 0"));
+        } else {
           Serial.print(F("[RP2040] FORMAT resultado len="));
           Serial.println((int)g_formatLen);
         }
@@ -855,7 +824,7 @@ static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t
   payload[3] = aux2;
 
   uint8_t base = (cmd & 0x7F);
-  bool isDD = (g_bytesPerSector > 128) || (base == 0x22) || ((cmd & 0x80) != 0);
+  bool isDD = g_isDDActive || (base == 0x22) || ((cmd & 0x80) != 0);
   payload[4] = isDD ? 1 : 0;
   payload[5] = 0;
 
@@ -863,20 +832,14 @@ static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t
   g_formatDone    = false;
   g_formatSuccess = false;
   g_formatLen     = 0;
-  g_formatStarted     = false;
-  g_formatChunkCount  = 0;
-  g_formatChunkMask32 = 0;
-  g_formatLastChunkMs = millis();
-  memset(g_formatBuf, 0, sizeof(g_formatBuf));
 
-  Serial.print(F("[RP2040] FORMAT cmd=0x"));
+  Serial.print(F("[RP2040] FORMAT "));
+  Serial.print(isDD ? F("DD") : F("SD"));
+  Serial.print(F(" cmd=0x"));
   if (cmd < 0x10) Serial.print('0');
   Serial.print(cmd, HEX);
-  Serial.print(F(" base=0x"));
-  if (base < 0x10) Serial.print('0');
-  Serial.print(base, HEX);
-  Serial.print(F(" bytesPerSector="));
-  Serial.print((uint16_t)g_bytesPerSector);
+  Serial.print(F(" g_isDDActive="));
+  Serial.print((bool)g_isDDActive);
   Serial.print(F(" payload[4]="));
   Serial.println(payload[4]);
 
@@ -889,11 +852,6 @@ static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t
 
   while (!g_formatDone && (millis() - t0) < TIMEOUT_MS) {
     delay(0);
-
-    if (g_formatStarted && (millis() - g_formatLastChunkMs) > 5000) {
-      Serial.println(F("[RP2040] FORMAT: timeout entre chunks"));
-      break;
-    }
 
     if (millis() - lastProgress > 15000) {
       unsigned long elapsed = (millis() - t0) / 1000;
@@ -924,12 +882,12 @@ static bool doRemoteFormatCommon(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t
 }
 
 bool doRemoteFormatSD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
-  Serial.println(F("[RP2040] FORMAT solicitado (wrapper SD/base 0x21)"));
+  Serial.println(F("[RP2040] FORMAT SD (base 0x21) solicitado"));
   return doRemoteFormatCommon(dev, cmd, aux1, aux2);
 }
 
 bool doRemoteFormatDD(uint8_t dev, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
-  Serial.println(F("[RP2040] FORMAT solicitado (wrapper DD/ED/base 0x22)"));
+  Serial.println(F("[RP2040] FORMAT DD/ED (base 0x22) solicitado"));
   Serial.print(F("[RP2040] g_bytesPerSector="));
   Serial.print((uint16_t)g_bytesPerSector);
   Serial.print(F(" g_isDDActive="));

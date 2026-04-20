@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <stdarg.h>
+#include "BridgeProtocol.h"
 
 #ifndef ESP_IDF_VERSION_MAJOR
 #define ESP_IDF_VERSION_MAJOR 4
@@ -16,17 +17,6 @@ Preferences prefs;
 #define MASTER_UART_BYTE_DEBUG 0   // 1 = logea cada byte UART (NO recomendado)
 
 // ===== Protocol =====
-#define TYPE_CMD_FRAME      0x01
-#define TYPE_SECTOR_CHUNK   0x10
-#define TYPE_ACK            0x11
-#define TYPE_NAK            0x12
-#define TYPE_HELLO          0x20
-#define TYPE_TIMING_UPDATE  0x30
-
-// NUEVO CFG
-#define TYPE_CFG_UPDATE     0x40
-#define TYPE_CFG_ACK        0x41
-
 #define UART_SYNC 0x55
 
 // D1..D4
@@ -280,19 +270,13 @@ static void applyDeviceToLogicalSlot(const uint8_t mac[6], uint8_t logic, bool s
 
 
 // Prefetch configurado por unidad - 1 sector es óptimo para XF551
-uint8_t prefetchCfg[4] = { 1, 1, 1, 1 };
+uint8_t prefetchCfg[4] = { 3, 3, 3, 3 };
 
 // ========= Tiempos SIO (µs) – ULTRA OPTIMIZADOS =========
-uint16_t T_ACK_TO_COMPLETE = 120;
-uint16_t T_COMPLETE_TO_DATA = 80;
-uint16_t T_DATA_TO_CHK = 15;
-uint16_t T_CHUNK_DELAY = 20;
-
-static const bool g_lockFastTimings = true;
-static const uint16_t kFastAckToComplete = 120;
-static const uint16_t kFastCompleteToData = 80;
-static const uint16_t kFastDataToChk = 15;
-static const uint16_t kFastChunkDelay = 20;
+uint16_t T_ACK_TO_COMPLETE = 220;    // perfil más ágil por defecto
+uint16_t T_COMPLETE_TO_DATA = 140;   // perfil más ágil por defecto
+uint16_t T_DATA_TO_CHK = 25;         // perfil más ágil por defecto
+uint16_t T_CHUNK_DELAY = 80;         // perfil más ágil por defecto
 
 // ========= Tiempos medidos por disquetera (ACK/NAK) =========
 struct DriveTiming {
@@ -302,19 +286,12 @@ struct DriveTiming {
 };
 DriveTiming g_driveTiming[4];
 
-int g_autoProfile = 1;
-
-static inline void applyFastTimingPreset() {
-  T_ACK_TO_COMPLETE = kFastAckToComplete;
-  T_COMPLETE_TO_DATA = kFastCompleteToData;
-  T_DATA_TO_CHK = kFastDataToChk;
-  T_CHUNK_DELAY = kFastChunkDelay;
-}
+int g_autoProfile = 2;
 
 // ========= WebServer & NVS =========
 WebServer server(80);
 // Preferences prefs;  // (declarado arriba)
-const uint32_t CFG_MAGIC = 0xCAFEBABE;
+const uint32_t CFG_MAGIC = 0xCAFEBABF;
 
 // ========= Comm/Verify CFG (NVS/UI) =========
 static const uint32_t BOOT_UART_BAUD = 460800;     // RP y Master arrancan acá
@@ -1173,7 +1150,6 @@ void saveCommConfigToNvs();
 void saveVerifyConfigToNvs();
 
 void autoTuneTimingsFromAck() {
-  if (g_lockFastTimings) return;
   bool anyAuto = false;
   for (int i = 0; i < 4; i++) {
     if (g_driveTiming[i].autoEnabled) { anyAuto = true; break; }
@@ -1191,37 +1167,38 @@ void autoTuneTimingsFromAck() {
   }
   if (!have) return;
 
+  // Importante: el ACK puede incluir latencia real del disco/caché.
+  // Si usamos ACKs altos para empujar timings SIO, el sistema completo se vuelve lento.
+  // Solo autoajustamos cuando el ACK ya es claramente rápido (camino caliente).
+  if (bestAckMs > 20) return;
+
   uint32_t ackUs = bestAckMs * 1000UL;
-
   float scale = 1.0f;
-  if (g_autoProfile == 0) scale = 1.5f;
-  else if (g_autoProfile == 2) scale = 0.7f;
-
+  if (g_autoProfile == 0) scale = 1.20f;      // seguro
+  else if (g_autoProfile == 2) scale = 0.85f; // agresivo
   ackUs = (uint32_t)(ackUs * scale);
 
-  uint16_t newAckToComplete   = clampU16(ackUs / 4, 300, 2000);
-  uint16_t newCompleteToData  = clampU16(ackUs / 6, 250, 1500);
-  uint16_t newChunkDelay      = clampU16(ackUs / 3, 100, 4000);
+  uint16_t newAckToComplete  = clampU16((uint16_t)(ackUs / 8), 120, 600);
+  uint16_t newCompleteToData = clampU16((uint16_t)(ackUs / 12), 80, 350);
+  uint16_t newChunkDelay     = clampU16((uint16_t)(ackUs / 10), 60, 500);
 
   bool changed = false;
-
-  if (abs((int)newAckToComplete - (int)T_ACK_TO_COMPLETE) > 50) {
+  if (abs((int)newAckToComplete - (int)T_ACK_TO_COMPLETE) > 25) {
     T_ACK_TO_COMPLETE = newAckToComplete; changed = true;
   }
-  if (abs((int)newCompleteToData - (int)T_COMPLETE_TO_DATA) > 50) {
+  if (abs((int)newCompleteToData - (int)T_COMPLETE_TO_DATA) > 20) {
     T_COMPLETE_TO_DATA = newCompleteToData; changed = true;
   }
-  if (T_DATA_TO_CHK == 0) { T_DATA_TO_CHK = 80; changed = true; }
-  if (abs((int)newChunkDelay - (int)T_CHUNK_DELAY) > 100) {
+  if (T_DATA_TO_CHK == 0) { T_DATA_TO_CHK = 25; changed = true; }
+  if (abs((int)newChunkDelay - (int)T_CHUNK_DELAY) > 30) {
     T_CHUNK_DELAY = newChunkDelay; changed = true;
   }
 
   if (changed) {
-    logf("[AUTO] ACK=%lu ms perfil=%d -> ackToComp=%u compToData=%u chunkDelay=%u",
+    logf("[AUTO] ACK caliente=%lu ms perfil=%d -> ackToComp=%u compToData=%u chunkDelay=%u",
          (unsigned long)bestAckMs, g_autoProfile,
          (unsigned)T_ACK_TO_COMPLETE, (unsigned)T_COMPLETE_TO_DATA, (unsigned)T_CHUNK_DELAY);
     saveTimingConfigToNvs();
-    // sendTimingUpdateToRP() está más abajo
   }
 }
 
@@ -1294,10 +1271,10 @@ void loadConfigFromNvs() {
     prefs.putUChar("pf3", prefetchCfg[2]);
     prefs.putUChar("pf4", prefetchCfg[3]);
     prefs.putUChar("autoProf", (uint8_t)g_autoProfile);
-    prefs.putUChar("auto1", 1);
-    prefs.putUChar("auto2", 1);
-    prefs.putUChar("auto3", 1);
-    prefs.putUChar("auto4", 1);
+    prefs.putUChar("auto1", 0);
+    prefs.putUChar("auto2", 0);
+    prefs.putUChar("auto3", 0);
+    prefs.putUChar("auto4", 0);
 
     // defaults comm/verify
     prefs.putUInt("uartBd", CFG_UART_BAUD);
@@ -1311,13 +1288,10 @@ void loadConfigFromNvs() {
     return;
   }
 
-  T_ACK_TO_COMPLETE   = prefs.getUShort("t_ack",  T_ACK_TO_COMPLETE);
-  T_COMPLETE_TO_DATA  = prefs.getUShort("t_comp", T_COMPLETE_TO_DATA);
-  T_DATA_TO_CHK       = prefs.getUShort("t_chk",  T_DATA_TO_CHK);
-  T_CHUNK_DELAY       = prefs.getUShort("t_chd",  T_CHUNK_DELAY);
-  if (g_lockFastTimings) {
-    applyFastTimingPreset();
-  }
+  T_ACK_TO_COMPLETE   = clampU16(prefs.getUShort("t_ack",  T_ACK_TO_COMPLETE), 120, 1200);
+  T_COMPLETE_TO_DATA  = clampU16(prefs.getUShort("t_comp", T_COMPLETE_TO_DATA), 80, 900);
+  T_DATA_TO_CHK       = clampU16(prefs.getUShort("t_chk",  T_DATA_TO_CHK), 15, 200);
+  T_CHUNK_DELAY       = clampU16(prefs.getUShort("t_chd",  T_CHUNK_DELAY), 60, 1200);
 
   prefetchCfg[0] = prefs.getUChar("pf1", prefetchCfg[0]);
   prefetchCfg[1] = prefs.getUChar("pf2", prefetchCfg[1]);
@@ -1326,14 +1300,10 @@ void loadConfigFromNvs() {
 
   g_autoProfile = prefs.getUChar("autoProf", (uint8_t)g_autoProfile);
 
-  g_driveTiming[0].autoEnabled = prefs.getUChar("auto1", 1) != 0;
-  g_driveTiming[1].autoEnabled = prefs.getUChar("auto2", 1) != 0;
-  g_driveTiming[2].autoEnabled = prefs.getUChar("auto3", 1) != 0;
-  g_driveTiming[3].autoEnabled = prefs.getUChar("auto4", 1) != 0;
-  if (g_lockFastTimings) {
-    g_autoProfile = 0;
-    for (int i = 0; i < 4; ++i) g_driveTiming[i].autoEnabled = false;
-  }
+  g_driveTiming[0].autoEnabled = prefs.getUChar("auto1", 0) != 0;
+  g_driveTiming[1].autoEnabled = prefs.getUChar("auto2", 0) != 0;
+  g_driveTiming[2].autoEnabled = prefs.getUChar("auto3", 0) != 0;
+  g_driveTiming[3].autoEnabled = prefs.getUChar("auto4", 0) != 0;
 
   // comm/verify
   CFG_UART_BAUD    = prefs.getUInt("uartBd", CFG_UART_BAUD);
@@ -1502,23 +1472,16 @@ void pollUartFromRP() {
               uint16_t newData2Chk  = getLE16(&p[4]);
               uint16_t newChunk     = getLE16(&p[6]);
 
-              if (g_lockFastTimings) {
-                applyFastTimingPreset();
-                logf("[MASTER] TIMING_UPDATE <- RP ignorado; usando preset rápido ack2comp=%u comp2data=%u data2chk=%u chunk=%u",
-                    (unsigned)T_ACK_TO_COMPLETE, (unsigned)T_COMPLETE_TO_DATA,
-                    (unsigned)T_DATA_TO_CHK, (unsigned)T_CHUNK_DELAY);
-              } else {
-                T_ACK_TO_COMPLETE  = clampU16(newAck2Comp,  200, 8000);
-                T_COMPLETE_TO_DATA = clampU16(newComp2Data, 100, 8000);
-                T_DATA_TO_CHK      = clampU16(newData2Chk,   10, 2000);
-                T_CHUNK_DELAY      = clampU16(newChunk,     100, 20000);
+              T_ACK_TO_COMPLETE  = clampU16(newAck2Comp,  120, 1200);
+              T_COMPLETE_TO_DATA = clampU16(newComp2Data, 80, 900);
+              T_DATA_TO_CHK      = clampU16(newData2Chk,  15, 200);
+              T_CHUNK_DELAY      = clampU16(newChunk,     60, 1200);
 
-                logf("[MASTER] TIMING_UPDATE <- RP ack2comp=%u comp2data=%u data2chk=%u chunk=%u",
-                    (unsigned)T_ACK_TO_COMPLETE, (unsigned)T_COMPLETE_TO_DATA,
-                    (unsigned)T_DATA_TO_CHK, (unsigned)T_CHUNK_DELAY);
+              logf("[MASTER] TIMING_UPDATE <- RP ack2comp=%u comp2data=%u data2chk=%u chunk=%u",
+                  (unsigned)T_ACK_TO_COMPLETE, (unsigned)T_COMPLETE_TO_DATA,
+                  (unsigned)T_DATA_TO_CHK, (unsigned)T_CHUNK_DELAY);
 
-                saveTimingConfigToNvs();
-              }
+              saveTimingConfigToNvs();
             } break;
 
             case TYPE_CMD_FRAME: {
@@ -2029,7 +1992,6 @@ void setup() {
   g_lastMasterOp.active = false;
 
   loadConfigFromNvs();
-  if (g_lockFastTimings) applyFastTimingPreset();
   loadMapFromNvs();
 
   // UART con RP siempre arranca BOOT
