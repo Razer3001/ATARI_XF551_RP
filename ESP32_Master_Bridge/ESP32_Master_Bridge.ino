@@ -1,8 +1,8 @@
 // ================================================================
 // ATARI_XF551_RP - ESP32 MASTER
-// BUILD: F40_CAS_LIBRARY_PROFILE_METADATA_2026-05-21_2158
-// DATE : 2026-05-21
-// TIME : 21:18
+// BUILD: F42G_LIBRARY_MANUAL_REFRESH_GUARD_2026-05-22_0042
+// DATE : 2026-05-22
+// TIME : 00:42
 // ARCHIVO: ESP32_Master_Bridge.ino
 //
 // CAMBIOS VIGENTES:
@@ -20,6 +20,11 @@
 // - F28: TNFS conserva .XEX/.COM/.EXE/.BAS crudos con su extension original; Biblioteca elimina contenedor antiguo.
 // - F29: CAS River Raid Cold Prism detectado como 600->4000 bps, sin confundirlo con FSK especial.
 // - F40: expone perfil CAS detectado en Biblioteca desde cache /CAS/.cache, sin cambiar aun reproduccion/carga real.
+// - F41: agrega UI/endpoint para overrides de perfil CAS en /CONFIG/cas_profiles.json.
+// - F41B: mueve CasProfileOverride a header para compilar correctamente en Arduino IDE.
+// - F42: Play CAS usa perfil efectivo (override/cache) para baud/gaps con fallback seguro.
+// - F42F: /api/library emite files por streaming seguro, sin buffer gigante y sin comas dobles.
+// - F42G: solo refresh manual confirmado reconstruye biblioteca; navegación/cassette no pueden guardar índice vacío.
 // ================================================================
 
 #include <Arduino.h>
@@ -46,6 +51,7 @@
 #include "WebAtrTypes.h"
 #include "TnfsTypes.h"
 #include "WebLibraryTypes.h"
+#include "CasProfileTypes.h"
 
 // ================================================================
 // F7_SD_STORAGE_ESP32_WROOM
@@ -183,7 +189,7 @@ static WebStorageAdapter WebStorage;
 
 Preferences prefs;
 
-static const char MASTER_BUILD[] = "F40_CAS_LIBRARY_PROFILE_METADATA_2026-05-21_2158";
+static const char MASTER_BUILD[] = "F42G_LIBRARY_MANUAL_REFRESH_GUARD_2026-05-22_0042";
 
 // ===== Debug =====
 #define MASTER_UART_BYTE_DEBUG 0   // 1 = logea cada byte UART (NO recomendado)
@@ -490,6 +496,11 @@ static uint32_t g_casLastSendMs = 0;
 static uint16_t g_casUserBaseBaud = 600;
 static uint16_t g_casTurboMultiplierX100 = 100;
 static bool     g_casTurboEnabled = false;
+// F42: perfil CAS efectivo aplicado al Play.
+static char     g_casEffectiveProfile[32] = "AUTO";
+static bool     g_casEffectiveProfileManual = false;
+static bool     g_casProfileLockBaud = false;
+static uint16_t g_casProfileForcedBaud = 0;
 static uint16_t g_casInitialDelaySec = 0;
 static char     g_casLoadMode[8] = "cload";   // cload | boot | auto
 static bool     g_casBootModeActive = false;
@@ -527,8 +538,13 @@ static uint32_t g_casAspeqtFragments = 0;
 static uint32_t g_casAspeqtFinalWaitMs = 500;
 
 static bool casIsKnownChunkType(const char* typ);
+static uint16_t casClampBaud(uint32_t baud);
 static void casAutoResetAnalysis();
 static bool casAnalyzeCasFile(const String& path);
+static bool webCasLooksLikeName(String name);
+static String webCasPathForName(const String& storedName);
+static String webAtrSanitizeFileName(const String& in);
+static bool webLibraryIndexRebuild(bool saveToFs);
 
 // ===== CASSETTE AUTO DETECT / CHUNK DIAG F49Z39 =====
 // Analiza FUJI-CAS/A8CAS antes de reproducir para diagnosticar chunks data/baud/fsk/pwm*.
@@ -704,6 +720,291 @@ static void casAutoSaveCache(const String& path) {
   }
 }
 
+// ===== F41: CAS profile manual overrides for Biblioteca =====
+// Archivo persistente: /CONFIG/cas_profiles.json
+// Formato simple y legible:
+// {"version":1,"profiles":{"Archivo.cas":"NORMAL_600"}}
+static const char CAS_PROFILE_OVERRIDES_PATH[] = "/CONFIG/cas_profiles.json";
+
+static bool casProfileEnsureConfigDir() {
+  if (!webAtrFsReady()) return false;
+  File d = SPIFFS.open("/CONFIG", "r");
+  if (d) {
+    bool ok = d.isDirectory();
+    d.close();
+    if (ok) return true;
+    SPIFFS.remove("/CONFIG");
+  } else if (SPIFFS.exists("/CONFIG")) {
+    SPIFFS.remove("/CONFIG");
+  }
+  if (!SPIFFS.mkdir("/CONFIG")) {
+    delay(10);
+    if (!SPIFFS.mkdir("/CONFIG")) return false;
+  }
+  File d2 = SPIFFS.open("/CONFIG", "r");
+  bool ok = d2 && d2.isDirectory();
+  if (d2) d2.close();
+  return ok;
+}
+
+static String casProfileNormalize(String profile) {
+  profile.trim();
+  profile.toUpperCase();
+  profile.replace("-", "_");
+  profile.replace(" ", "_");
+  if (!profile.length()) profile = "AUTO";
+  return profile;
+}
+
+static bool casProfileAllowed(const String& profileIn) {
+  String p = casProfileNormalize(profileIn);
+  return p == "AUTO" ||
+         p == "NORMAL_600" ||
+         p == "IRON_STD_600" ||
+         p == "TURBO_SOFTWARE" ||
+         p == "TURBO_SOFTWARE_V2_800" ||
+         p == "STAC_PROBABLE" ||
+         p == "CAIN_217_PROBABLE" ||
+         p == "INJEKTOR_4000" ||
+         p == "INJEKTOR_6000" ||
+         p == "TURBO_2000" ||
+         p == "TURBO_2600" ||
+         p == "KSO_T2000F" ||
+         p == "COLD_PRISM_4000" ||
+         p == "TURBO_6000_CHAOS" ||
+         p == "PWM_TURBO" ||
+         p == "FSK_ESPECIAL" ||
+         p == "RAW_BIN" ||
+         p == "UNKNOWN_TURBO" ||
+         p == "PERSONALIZADO";
+}
+
+static int casProfileFindMatchingBrace(const String& s, int openPos) {
+  if (openPos < 0 || openPos >= (int)s.length() || s[openPos] != '{') return -1;
+  bool inString = false;
+  bool esc = false;
+  int level = 0;
+  for (int i = openPos; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (inString) {
+      if (esc) { esc = false; continue; }
+      if (c == '\\') { esc = true; continue; }
+      if (c == '"') inString = false;
+      continue;
+    }
+    if (c == '"') { inString = true; continue; }
+    if (c == '{') level++;
+    else if (c == '}') {
+      level--;
+      if (level == 0) return i;
+      if (level < 0) return -1;
+    }
+  }
+  return -1;
+}
+
+static void casProfileSkipWs(const String& s, int& i) {
+  while (i < (int)s.length()) {
+    char c = s[i];
+    if (c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == ',') i++;
+    else break;
+  }
+}
+
+static bool casProfileReadJsonStringAt(const String& s, int& i, String& out) {
+  out = "";
+  casProfileSkipWs(s, i);
+  if (i >= (int)s.length() || s[i] != '"') return false;
+  i++;
+  bool esc = false;
+  for (; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (esc) {
+      if (c == 'n') out += '\n';
+      else if (c == 'r') out += '\r';
+      else if (c == 't') out += '\t';
+      else out += c;
+      esc = false;
+      continue;
+    }
+    if (c == '\\') { esc = true; continue; }
+    if (c == '"') { i++; return true; }
+    out += c;
+  }
+  return false;
+}
+
+static bool casProfileOverrideLoadAll(std::vector<CasProfileOverride>& list) {
+  list.clear();
+  if (!webAtrFsReady() || !SPIFFS.exists(CAS_PROFILE_OVERRIDES_PATH)) return true;
+  File f = SPIFFS.open(CAS_PROFILE_OVERRIDES_PATH, "r");
+  if (!f) return false;
+  String txt = f.readString();
+  f.close();
+  txt.trim();
+  if (!txt.length()) return true;
+
+  int p = txt.indexOf("\"profiles\"");
+  if (p < 0) return true;
+  int open = txt.indexOf('{', p);
+  int close = casProfileFindMatchingBrace(txt, open);
+  if (open < 0 || close <= open) return false;
+
+  int i = open + 1;
+  while (i < close) {
+    casProfileSkipWs(txt, i);
+    if (i >= close) break;
+    String file, profile;
+    if (!casProfileReadJsonStringAt(txt, i, file)) break;
+    casProfileSkipWs(txt, i);
+    if (i >= close || txt[i] != ':') break;
+    i++;
+    if (!casProfileReadJsonStringAt(txt, i, profile)) break;
+    file = webAtrSanitizeFileName(file);
+    profile = casProfileNormalize(profile);
+    if (file.length() && webCasLooksLikeName(file) && casProfileAllowed(profile) && profile != "AUTO") {
+      CasProfileOverride o;
+      o.file = file;
+      o.profile = profile;
+      list.push_back(o);
+    }
+  }
+  return true;
+}
+
+static bool casProfileOverrideSaveAll(const std::vector<CasProfileOverride>& list) {
+  if (!casProfileEnsureConfigDir()) return false;
+  File f = SPIFFS.open(CAS_PROFILE_OVERRIDES_PATH, "w");
+  if (!f) return false;
+  f.print("{\"version\":1,\"build\":\"");
+  f.print(jsonEscape(String(MASTER_BUILD)));
+  f.print("\",\"profiles\":{");
+  bool first = true;
+  for (const CasProfileOverride& o : list) {
+    if (!o.file.length() || !o.profile.length() || o.profile == "AUTO") continue;
+    if (!first) f.print(',');
+    first = false;
+    f.print('"'); f.print(jsonEscape(o.file)); f.print("\":\"");
+    f.print(jsonEscape(casProfileNormalize(o.profile)));
+    f.print('"');
+  }
+  f.print("}}\n");
+  f.flush();
+  f.close();
+  return true;
+}
+
+static bool casProfileOverrideGet(const String& rawFile, String& profileOut) {
+  profileOut = "";
+  String file = webAtrSanitizeFileName(rawFile);
+  if (!file.length() || !webCasLooksLikeName(file)) return false;
+  std::vector<CasProfileOverride> list;
+  if (!casProfileOverrideLoadAll(list)) return false;
+  for (const CasProfileOverride& o : list) {
+    if (o.file.equalsIgnoreCase(file)) {
+      profileOut = casProfileNormalize(o.profile);
+      return profileOut.length() && profileOut != "AUTO";
+    }
+  }
+  return false;
+}
+
+static bool casProfileOverrideSet(const String& rawFile, const String& profileIn, String& err, String& effectiveProfile) {
+  err = "";
+  effectiveProfile = "AUTO";
+  String file = webAtrSanitizeFileName(rawFile);
+  if (!file.length() || !webCasLooksLikeName(file)) { err = "Archivo CAS inválido"; return false; }
+  String profile = casProfileNormalize(profileIn);
+  if (!casProfileAllowed(profile)) { err = "Perfil CAS no permitido"; return false; }
+
+  std::vector<CasProfileOverride> list;
+  if (!casProfileOverrideLoadAll(list)) { err = "No se pudo leer cas_profiles.json"; return false; }
+
+  int found = -1;
+  for (int i = 0; i < (int)list.size(); i++) {
+    if (list[i].file.equalsIgnoreCase(file)) { found = i; break; }
+  }
+
+  if (profile == "AUTO") {
+    if (found >= 0) list.erase(list.begin() + found);
+  } else {
+    if (found >= 0) list[found].profile = profile;
+    else {
+      CasProfileOverride o;
+      o.file = file;
+      o.profile = profile;
+      list.push_back(o);
+    }
+    effectiveProfile = profile;
+  }
+
+  if (!casProfileOverrideSaveAll(list)) { err = "No se pudo guardar /CONFIG/cas_profiles.json"; return false; }
+  return true;
+}
+
+static String casProfileEffectiveForFile(const String& file, const CasAutoAnalysis* cached) {
+  String overrideProfile;
+  if (casProfileOverrideGet(file, overrideProfile)) return overrideProfile;
+  if (cached && cached->valid && cached->profile[0]) return String(cached->profile);
+  return String("AUTO");
+}
+
+static void casSetEffectiveProfileRuntime(const String& profile, bool manualOverride) {
+  String p = casProfileNormalize(profile);
+  if (!casProfileAllowed(p)) p = "AUTO";
+  memset(g_casEffectiveProfile, 0, sizeof(g_casEffectiveProfile));
+  strncpy(g_casEffectiveProfile, p.c_str(), sizeof(g_casEffectiveProfile) - 1);
+  g_casEffectiveProfileManual = manualOverride && p != "AUTO";
+  g_casProfileLockBaud = false;
+  g_casProfileForcedBaud = 0;
+}
+
+static void casApplyEffectiveProfileForPlayback(const String& profile, bool manualOverride) {
+  String p = casProfileNormalize(profile);
+  casSetEffectiveProfileRuntime(p, manualOverride);
+
+  g_casTurboMultiplierX100 = 100;
+  g_casTurboEnabled = false;
+
+  if (p == "NORMAL_600") {
+    g_casUserBaseBaud = 600;
+    g_casProfileLockBaud = true;
+    g_casProfileForcedBaud = 600;
+    return;
+  }
+
+  if (p == "IRON_STD_600") {
+    g_casUserBaseBaud = 600;
+    g_casProfileLockBaud = true;
+    g_casProfileForcedBaud = 600;
+    g_casIronTurboCompat = true;
+    g_casIronTurboTurboBaud = 600;
+    return;
+  }
+
+  if (p == "TURBO_SOFTWARE_V2_800" || p == "TURBO_2000" || p == "TURBO_2600" || p == "KSO_T2000F" || p == "COLD_PRISM_4000") {
+    uint16_t b = g_casAutoAnalysis.initialBaud ? g_casAutoAnalysis.initialBaud : 600;
+    g_casUserBaseBaud = casClampBaud(b);
+    return;
+  }
+
+  if (p == "INJEKTOR_6000" || p == "TURBO_6000_CHAOS") {
+    g_casUserBaseBaud = 6000;
+    g_casProfileLockBaud = true;
+    g_casProfileForcedBaud = 6000;
+    return;
+  }
+
+  if (p == "STAC_PROBABLE" || p == "CAIN_217_PROBABLE" || p == "PWM_TURBO" || p == "FSK_ESPECIAL" || p == "RAW_BIN" || p == "UNKNOWN_TURBO" || p == "PERSONALIZADO") {
+    uint16_t b = g_casAutoAnalysis.initialBaud ? g_casAutoAnalysis.initialBaud : 600;
+    g_casUserBaseBaud = casClampBaud(b);
+    return;
+  }
+
+  g_casUserBaseBaud = 600;
+}
+
+
 
 // ===== WEB-ATR FAST LOAD V28 =====
 // Optimización encapsulada para lectura ATR -> Atari.
@@ -788,6 +1089,7 @@ static bool handleBtSio2pcFrame(uint8_t dev, const uint8_t* payload, uint8_t len
 void handleBtSio2pcSet();
 void handleCasStatus();
 void handleCasAnalyze();
+void handleCasProfile();
 void handleCasMount();
 void handleCasUnmount();
 void handleCasPlay();
@@ -9563,9 +9865,16 @@ static void webAtrAppendFileListJson(String &j) {
     if (isCas) {
       CasAutoAnalysis cachedCas;
       bool casCached = casAutoLoadCacheForPath(path, cachedCas);
+      String casOverrideProfile;
+      bool hasCasOverride = casProfileOverrideGet(name, casOverrideProfile);
+      String casEffectiveProfile = hasCasOverride ? casOverrideProfile : (casCached ? String(cachedCas.profile) : String("AUTO"));
       j += ",\"casAnalyzed\":" + String(casCached ? 1 : 0);
+      j += ",\"casOverride\":" + String(hasCasOverride ? 1 : 0);
+      j += ",\"casOverrideProfile\":\"" + jsonEscape(hasCasOverride ? casOverrideProfile : String("AUTO")) + "\"";
+      j += ",\"casEffectiveProfile\":\"" + jsonEscape(casEffectiveProfile) + "\"";
       if (casCached) {
         j += ",\"casProfile\":\"" + jsonEscape(String(cachedCas.profile)) + "\"";
+        j += ",\"casAutoProfile\":\"" + jsonEscape(String(cachedCas.profile)) + "\"";
         j += ",\"casConfidence\":\"" + jsonEscape(String(cachedCas.confidence)) + "\"";
         j += ",\"casSuggestedMode\":\"" + jsonEscape(String(cachedCas.suggestedMode)) + "\"";
         j += ",\"casInitialBaud\":" + String((unsigned)cachedCas.initialBaud);
@@ -9596,6 +9905,7 @@ static const uint32_t WEB_ATR_FILES_CACHE_TTL_MS = 30000UL; // F49Z24: menos esc
 // para evitar escanear /ATR, /CAS, /LIBRARY y raíz cada vez que se abre la web/app.
 static const char WEB_LIBRARY_INDEX_DIR[] = "/CONFIG";
 static const char WEB_LIBRARY_INDEX_PATH[] = "/CONFIG/library_index.json";
+static const char WEB_LIBRARY_INDEX_BAK_PATH[] = "/CONFIG/library_index.bak.json";
 static String   g_webLibraryIndexJson;
 static bool     g_webLibraryIndexLoaded = false;
 static bool     g_webLibraryIndexDirty = false;
@@ -9615,6 +9925,37 @@ static uint32_t webLibraryCountObjects(const String& entries) {
   int p = 0;
   while ((p = entries.indexOf("\"name\"", p)) >= 0) { count++; p += 8; }
   return count;
+}
+
+// F42B: defensa final contra JSON de biblioteca con coma colgante.
+// Algunas rutas legacy/F41 podían dejar el índice interno o persistido como:
+//   { ... },]
+// Eso rompe JSON.parse() en la web. Normalizamos SIEMPRE la parte interna
+// del array antes de guardar, validar o servir /api/library.
+static void webLibraryNormalizeEntriesJson(String& entries) {
+  entries.trim();
+  if (entries.startsWith("[")) entries = entries.substring(1);
+  if (entries.endsWith("]")) entries = entries.substring(0, entries.length() - 1);
+  entries.trim();
+
+  // F42F: corregir separadores dobles entre objetos generados por rutas
+  // intermedias/streaming anteriores:  {...},,{...}
+  // No hacemos replace global de ",," para no tocar texto dentro de strings.
+  int guard = 0;
+  while (entries.indexOf("},,{") >= 0 && guard++ < 32) {
+    entries.replace("},,{", "},{");
+  }
+
+  while (entries.endsWith(",")) {
+    entries.remove(entries.length() - 1);
+    entries.trim();
+  }
+}
+
+static String webLibraryNormalizedEntriesCopy(const String& in) {
+  String out = in;
+  webLibraryNormalizeEntriesJson(out);
+  return out;
 }
 
 // F49Z44: evita servir un indice corrupto creado por una version anterior.
@@ -9685,29 +10026,42 @@ static bool webLibraryEnsureConfigDir() {
   return webLibraryDirExists(WEB_LIBRARY_INDEX_DIR);
 }
 
-static bool webLibraryIndexLoadFromFs() {
-  if (!webAtrFsReady() || !SPIFFS.exists(WEB_LIBRARY_INDEX_PATH)) return false;
-  uint32_t t0 = millis();
-  File f = SPIFFS.open(WEB_LIBRARY_INDEX_PATH, "r");
+static bool webLibraryLoadEntriesFromPath(const char* path, String& out, uint32_t* countOut = nullptr) {
+  out = "";
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, "r");
   if (!f) return false;
-  g_webLibraryIndexJson = f.readString();
+  out = f.readString();
   f.close();
-  g_webLibraryIndexJson.trim();
-  if (g_webLibraryIndexJson.startsWith("[")) g_webLibraryIndexJson = g_webLibraryIndexJson.substring(1);
-  if (g_webLibraryIndexJson.endsWith("]")) g_webLibraryIndexJson = g_webLibraryIndexJson.substring(0, g_webLibraryIndexJson.length() - 1);
+  webLibraryNormalizeEntriesJson(out);
+  if (!webLibraryEntriesLooksValid(out)) return false;
+  uint32_t c = webLibraryCountObjects(out);
+  if (countOut) *countOut = c;
+  return c > 0;
+}
 
-  if (!webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
-    logf("[LIB-IDX] indice corrupto; se elimina y reconstruye");
+static bool webLibraryIndexLoadFromFs() {
+  uint32_t t0 = millis();
+  String entries;
+  uint32_t count = 0;
+  bool ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, entries, &count);
+  if (!ok) {
+    // F42G: si el índice principal quedó vacío/corrupto por una versión anterior,
+    // intentar recuperar el último índice bueno desde backup.
+    ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, entries, &count);
+    if (ok) logf("[LIB-IDX] recuperado desde backup count=%u", (unsigned)count);
+  }
+  if (!ok) {
     g_webLibraryIndexJson = "";
     g_webLibraryIndexCount = 0;
     g_webLibraryIndexLoaded = false;
-    g_webLibraryIndexDirty = true;
-    SPIFFS.remove(WEB_LIBRARY_INDEX_PATH);
+    g_webLibraryIndexDirty = false;
     g_webLibraryIndexLoadMs = millis() - t0;
     return false;
   }
 
-  g_webLibraryIndexCount = webLibraryCountObjects(g_webLibraryIndexJson);
+  g_webLibraryIndexJson = entries;
+  g_webLibraryIndexCount = count;
   g_webLibraryIndexLoaded = true;
   g_webLibraryIndexDirty = false;
   g_webLibraryIndexLoadMs = millis() - t0;
@@ -9773,6 +10127,7 @@ static bool webLibraryIndexSaveToFs() {
   }
 
   size_t written = 0;
+  webLibraryNormalizeEntriesJson(g_webLibraryIndexJson);
   written += f.print("[");
   written += f.print(g_webLibraryIndexJson);
   written += f.print("]");
@@ -9798,6 +10153,17 @@ static bool webLibraryIndexSaveToFs() {
       " bytes=" + String(fileBytes) + "/" + String(g_webLibraryIndexLastSavedBytes);
   } else {
     g_webLibraryIndexLastSaveError = "";
+    // F42G: guardar copia de seguridad solo cuando el índice verificado contiene archivos.
+    if (g_webLibraryIndexCount > 0) {
+      File bf = SPIFFS.open(WEB_LIBRARY_INDEX_BAK_PATH, "w");
+      if (bf) {
+        bf.print("[");
+        bf.print(g_webLibraryIndexJson);
+        bf.print("]");
+        bf.flush();
+        bf.close();
+      }
+    }
   }
 
   logf("[LIB-IDX] save ok=%u verify=%u bytes=%lu count=%lu/%lu ms=%lu err=%s",
@@ -9818,9 +10184,53 @@ static bool webLibraryIndexRebuild(bool saveToFs = true) {
   String tmp;
   tmp.reserve(g_webAtrFilesJsonCache.length() ? g_webAtrFilesJsonCache.length() : 4096);
   webAtrAppendFileListJson(tmp);
+  webLibraryNormalizeEntriesJson(tmp);
+
+  bool entriesValid = webLibraryEntriesLooksValid(tmp);
+  uint32_t newCount = webLibraryCountObjects(tmp);
+
+  // F42G: jamás reemplazar en RAM ni en SD un índice bueno por [] durante
+  // navegación normal, salida de Cassette o refresh accidental. Si el escaneo
+  // devuelve cero, se conserva RAM -> índice principal -> backup.
+  if (newCount == 0) {
+    String oldEntries;
+    uint32_t oldCount = 0;
+    if (g_webLibraryIndexLoaded && g_webLibraryIndexJson.length() && webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
+      oldEntries = g_webLibraryIndexJson;
+      oldCount = webLibraryCountObjects(oldEntries);
+    }
+    if (oldCount == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, oldEntries, &oldCount);
+    if (oldCount == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, oldEntries, &oldCount);
+
+    if (oldCount > 0) {
+      g_webLibraryIndexJson = oldEntries;
+      g_webLibraryIndexCount = oldCount;
+      g_webLibraryIndexBuildMs = millis() - t0;
+      g_webLibraryIndexLoaded = true;
+      g_webLibraryIndexDirty = false;
+      g_webLibraryIndexLastSaveOk = true;
+      g_webLibraryIndexLastVerifyOk = true;
+      g_webLibraryIndexLastVerifyCount = g_webLibraryIndexCount;
+      g_webLibraryIndexLastSavedBytes = g_webLibraryIndexJson.length() + 2;
+      g_webLibraryIndexLastSaveError = "Escaneo devolvio 0; se conserva indice previo/backup";
+      logf("[LIB-IDX] rebuild scan=0; conservando indice count=%u", (unsigned)g_webLibraryIndexCount);
+      return true;
+    }
+
+    g_webLibraryIndexJson = "";
+    g_webLibraryIndexCount = 0;
+    g_webLibraryIndexBuildMs = millis() - t0;
+    g_webLibraryIndexLoaded = false;
+    g_webLibraryIndexDirty = false;
+    g_webLibraryIndexLastSaveOk = false;
+    g_webLibraryIndexLastVerifyOk = false;
+    g_webLibraryIndexLastSaveError = "Escaneo devolvio 0 archivos; no se guarda indice vacio";
+    logf("[LIB-IDX] rebuild scan=0 sin indice previo; no se guarda []");
+    return false;
+  }
+
   g_webLibraryIndexJson = tmp;
-  bool entriesValid = webLibraryEntriesLooksValid(g_webLibraryIndexJson);
-  g_webLibraryIndexCount = webLibraryCountObjects(g_webLibraryIndexJson);
+  g_webLibraryIndexCount = newCount;
 
   // F37: no responder 500 si el escaneo produjo entradas. En F36 el validador
   // podia fallar por falsos positivos o por fragmentacion de String, aunque el
@@ -9863,11 +10273,11 @@ static bool webLibraryIndexRebuild(bool saveToFs = true) {
 
 // [F24] Eliminado helper no usado: webLibraryIndexInvalidate
 static bool webLibraryIndexEnsure(bool forceRefresh) {
-  // F49Z46: solo el boton "Refrescar biblioteca" debe escanear la SD
-  // y actualizar /CONFIG/library_index.json. Las cargas normales solo leen
-  // el indice existente en RAM/FS; si no existe, responden lista vacia.
+  // F42G/F49Z46: solo refresh manual confirmado debe escanear la SD y actualizar
+  // /CONFIG/library_index.json. Navegación normal, Cassette y /api/atr/status
+  // solo leen RAM/FS/backup y nunca reconstruyen ni guardan [].
   if (forceRefresh) return webLibraryIndexRebuild(true);
-  if (g_webLibraryIndexLoaded) { g_webLibraryIndexHits++; return true; }
+  if (g_webLibraryIndexLoaded && g_webLibraryIndexCount > 0) { g_webLibraryIndexHits++; return true; }
   if (webLibraryIndexLoadFromFs()) { g_webLibraryIndexHits++; return true; }
   return false;
 }
@@ -9929,6 +10339,77 @@ static bool webLibraryObjectMatches(const String& obj, const String& qLower, con
   return true;
 }
 
+
+// F42F: contar matches sin construir un String gigante con todos los archivos.
+static uint32_t webLibraryCountMatchingEntries(const String& entries, const String& qLower, const String& typeUpper) {
+  uint32_t total = 0;
+  int p = 0;
+  while (p < (int)entries.length()) {
+    int a = entries.indexOf('{', p);
+    if (a < 0) break;
+    int b = entries.indexOf('}', a);
+    if (b < 0) break;
+    String obj = entries.substring(a, b + 1);
+    if (webLibraryObjectMatches(obj, qLower, typeUpper)) total++;
+    p = b + 1;
+  }
+  return total;
+}
+
+// F42F: enviar files[] directo al cliente con separador controlado.
+// Esto evita tres problemas vistos en F42D/F42E:
+// 1) doble coma: },,{
+// 2) String pageEntries gigante y fragmentado
+// 3) respuesta chunked cortada antes de cerrar ]}
+static void webLibraryStreamPagedEntries(const String& entries, int page, int pageSize, const String& qLower, const String& typeUpper) {
+  if (page < 0) page = 0;
+  if (pageSize <= 0) pageSize = 10000;
+  if (pageSize > 10000) pageSize = 10000;
+
+  int startWanted = page * pageSize;
+  int added = 0;
+  int seen = 0;
+  bool first = true;
+  int p = 0;
+
+  String buf;
+  buf.reserve(2048);
+
+  while (p < (int)entries.length()) {
+    int a = entries.indexOf('{', p);
+    if (a < 0) break;
+    int b = entries.indexOf('}', a);
+    if (b < 0) break;
+
+    String obj = entries.substring(a, b + 1);
+    if (webLibraryObjectMatches(obj, qLower, typeUpper)) {
+      if (seen >= startWanted && added < pageSize) {
+        if (!first) buf += ",";
+        buf += obj;
+        first = false;
+        added++;
+
+        if (buf.length() >= 2048) {
+          server.sendContent(buf);
+          buf = "";
+          delay(0);
+        }
+      }
+      seen++;
+      if (added >= pageSize) {
+        // Se puede cortar aquí porque totalMatches ya fue calculado antes.
+        break;
+      }
+    }
+    p = b + 1;
+  }
+
+  if (buf.length()) {
+    server.sendContent(buf);
+    delay(0);
+  }
+}
+
 // F49Z48: conteos por tipo calculados desde el indice completo, no desde
 // la pagina visible. Esto evita que los botones ATR/XEX/CAS muestren solo
 // los 20 elementos de la pagina actual.
@@ -9970,8 +10451,8 @@ static void webLibraryAppendTypeCountsJson(String& json, const String& entries, 
 
 static void webLibraryAppendPagedEntries(String& out, const String& entries, int page, int pageSize, const String& qLower, const String& typeUpper, uint32_t& totalMatches) {
   if (page < 0) page = 0;
-  if (pageSize <= 0) pageSize = 20;
-  if (pageSize > 100) pageSize = 100;
+  if (pageSize <= 0) pageSize = 10000;
+  if (pageSize > 10000) pageSize = 10000;
   int startWanted = page * pageSize;
   int added = 0;
   int seen = 0;
@@ -10084,6 +10565,10 @@ void handleAtrStatus() {
     includeFiles = !(fv == "0" || fv == "false" || fv == "no");
   }
   bool forceFilesRefresh = server.hasArg("refresh") && server.arg("refresh") == "1";
+  // F42G: /api/atr/status no puede reconstruir la biblioteca salvo refresh manual confirmado.
+  // Esto evita que salir de Cassette o entrar a Biblioteca dispare un escaneo accidental que deje todo en 0.
+  bool manualFilesRefresh = forceFilesRefresh && server.hasArg("manual") && server.arg("manual") == "1";
+  if (forceFilesRefresh && !manualFilesRefresh) forceFilesRefresh = false;
   String j = "{";
   j += "\"compiled\":true";
   j += ",\"mode\":\"flash-multi\"";
@@ -10567,6 +11052,10 @@ void handleCasStatus() {
   j += ",\"ironTurboCompat\":" + String(g_casIronTurboCompat ? "true" : "false");
   j += ",\"ironTurboDetected\":" + String(g_casIronTurboDetected ? "true" : "false");
   j += ",\"ironTurboEffective\":" + String((g_casIronTurboCompat || g_casIronTurboDetected) ? "true" : "false");
+  j += ",\"casEffectiveProfile\":\"" + jsonEscape(String(g_casEffectiveProfile)) + "\"";
+  j += ",\"casEffectiveProfileManual\":" + String(g_casEffectiveProfileManual ? "true" : "false");
+  j += ",\"casProfileLockBaud\":" + String(g_casProfileLockBaud ? "true" : "false");
+  j += ",\"casProfileForcedBaud\":" + String((unsigned)g_casProfileForcedBaud);
   j += ",\"ironTurboTurboBaud\":" + String((unsigned)g_casIronTurboTurboBaud);
   j += ",\"ironTurboGapFixes\":" + String((unsigned long)g_casIronTurboGapFixes);
   j += ",\"prevCompletedRecordMarker\":" + String((unsigned)g_casPrevCompletedRecordMarker);
@@ -10691,6 +11180,13 @@ void handleCasAnalyze() {
   }
 
   bool ok = casAnalyzeCasFile(path);
+  // F41: si se analiza desde Biblioteca, la cache queda persistida y se reconstruye
+  // el índice para que /api/library exponga casAnalyzed/casProfile sin esperar otro refresco manual.
+  bool indexRebuilt = false;
+  if (ok) indexRebuilt = webLibraryIndexRebuild(true);
+  String casOverrideProfile;
+  bool hasCasOverride = casProfileOverrideGet(name, casOverrideProfile);
+  String casEffectiveProfile = hasCasOverride ? casOverrideProfile : String(g_casAutoAnalysis.profile);
   String j = "{";
   j += "\"ok\":" + String(ok ? "true" : "false");
   j += ",\"build\":\"" + jsonEscape(String(MASTER_BUILD)) + "\"";
@@ -10699,6 +11195,10 @@ void handleCasAnalyze() {
   j += ",\"profile\":\"" + jsonEscape(String(g_casAutoAnalysis.profile)) + "\"";
   j += ",\"confidence\":\"" + jsonEscape(String(g_casAutoAnalysis.confidence)) + "\"";
   j += ",\"suggestedMode\":\"" + jsonEscape(String(g_casAutoAnalysis.suggestedMode)) + "\"";
+  j += ",\"indexRebuilt\":" + String(indexRebuilt ? "true" : "false");
+  j += ",\"casOverride\":" + String(hasCasOverride ? "true" : "false");
+  j += ",\"casOverrideProfile\":\"" + jsonEscape(hasCasOverride ? casOverrideProfile : String("AUTO")) + "\"";
+  j += ",\"casEffectiveProfile\":\"" + jsonEscape(casEffectiveProfile) + "\"";
   j += ",\"fuji\":" + String(g_casAutoAnalysis.fujiFormat ? "true" : "false");
   j += ",\"raw\":" + String(g_casAutoAnalysis.rawFormat ? "true" : "false");
   j += ",\"fileBytes\":" + String((unsigned long)g_casAutoAnalysis.fileBytes);
@@ -10726,6 +11226,64 @@ void handleCasAnalyze() {
   j += "}";
   j += ",\"chunkSummary\":\"" + jsonEscape(String(g_casAutoAnalysis.chunkSummary)) + "\"";
   j += ",\"notes\":\"" + jsonEscape(String(g_casAutoAnalysis.notes)) + "\"";
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+
+void handleCasProfile() {
+  String name = server.hasArg("file") ? webAtrSanitizeFileName(server.arg("file")) : String("");
+  if (!name.length() || !webCasLooksLikeName(name)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Falta archivo .CAS\"}");
+    return;
+  }
+
+  String profile = server.hasArg("profile") ? server.arg("profile") : String("");
+  bool doSet = server.hasArg("profile") || (server.hasArg("set") && server.arg("set").toInt() != 0);
+
+  if (doSet) {
+    profile = casProfileNormalize(profile);
+    String err, effective;
+    bool ok = casProfileOverrideSet(name, profile, err, effective);
+    bool indexRebuilt = false;
+    if (ok) indexRebuilt = webLibraryIndexRebuild(true);
+
+    String autoProfile = "";
+    CasAutoAnalysis cachedCas;
+    bool casCached = casAutoLoadCacheForPath(webCasPathForName(name), cachedCas);
+    if (casCached) autoProfile = String(cachedCas.profile);
+    String outEffective = (profile == "AUTO") ? (casCached ? autoProfile : String("AUTO")) : effective;
+
+    String j = "{";
+    j += "\"ok\":" + String(ok ? "true" : "false");
+    j += ",\"build\":\"" + jsonEscape(String(MASTER_BUILD)) + "\"";
+    j += ",\"file\":\"" + jsonEscape(name) + "\"";
+    j += ",\"profile\":\"" + jsonEscape(profile) + "\"";
+    j += ",\"override\":" + String((ok && profile != "AUTO") ? "true" : "false");
+    j += ",\"overrideProfile\":\"" + jsonEscape((ok && profile != "AUTO") ? profile : String("AUTO")) + "\"";
+    j += ",\"autoProfile\":\"" + jsonEscape(casCached ? autoProfile : String("")) + "\"";
+    j += ",\"effectiveProfile\":\"" + jsonEscape(outEffective) + "\"";
+    j += ",\"indexRebuilt\":" + String(indexRebuilt ? "true" : "false");
+    if (!ok) j += ",\"error\":\"" + jsonEscape(err) + "\"";
+    j += "}";
+    server.send(ok ? 200 : 500, "application/json", j);
+    return;
+  }
+
+  String overrideProfile;
+  bool hasOverride = casProfileOverrideGet(name, overrideProfile);
+  CasAutoAnalysis cachedCas;
+  bool casCached = casAutoLoadCacheForPath(webCasPathForName(name), cachedCas);
+  String effective = hasOverride ? overrideProfile : (casCached ? String(cachedCas.profile) : String("AUTO"));
+
+  String j = "{";
+  j += "\"ok\":true";
+  j += ",\"build\":\"" + jsonEscape(String(MASTER_BUILD)) + "\"";
+  j += ",\"file\":\"" + jsonEscape(name) + "\"";
+  j += ",\"override\":" + String(hasOverride ? "true" : "false");
+  j += ",\"overrideProfile\":\"" + jsonEscape(hasOverride ? overrideProfile : String("AUTO")) + "\"";
+  j += ",\"autoProfile\":\"" + jsonEscape(casCached ? String(cachedCas.profile) : String("")) + "\"";
+  j += ",\"effectiveProfile\":\"" + jsonEscape(effective) + "\"";
   j += "}";
   server.send(200, "application/json", j);
 }
@@ -11393,12 +11951,17 @@ static bool casBuildNextRawSdriveRecord() {
 }
 
 static uint16_t casEffectiveBaud(uint16_t sourceBaud) {
+  if (g_casProfileLockBaud && g_casProfileForcedBaud > 0) {
+    g_casAspeqtEffectiveBaud = casClampBaud(g_casProfileForcedBaud);
+    return g_casAspeqtEffectiveBaud;
+  }
+
   uint32_t b = sourceBaud ? sourceBaud : 600;
   if (g_casUserBaseBaud > b) b = g_casUserBaseBaud;
   if (g_casTurboEnabled) b = (b * (uint32_t)g_casTurboMultiplierX100) / 100UL;
 
-  // F49Z11: sin modo AspeQt. Usamos perfil seleccionado/auto / baud embebido
-  // hasta 6000 bps. 600 queda recomendado para compatibilidad estándar.
+  // F42: NORMAL_600/IRON_STD_600 bloquean el baud para que chunks baud
+  // posteriores no suban la velocidad por accidente.
   g_casAspeqtEffectiveBaud = casClampBaud(b);
   return g_casAspeqtEffectiveBaud;
 }
@@ -11952,23 +12515,47 @@ void handleCasPlay() {
   if (!(reqMode == "cload" || reqMode == "boot" || reqMode == "auto")) reqMode = "boot";
   strncpy(g_casLoadMode, reqMode.c_str(), sizeof(g_casLoadMode) - 1);
   g_casLoadMode[sizeof(g_casLoadMode) - 1] = '\0';
-  bool autoSpeed = (reqMode == "auto") || (server.hasArg("auto") && server.arg("auto").toInt() != 0);
   bool bootMode = (reqMode == "boot") || (reqMode == "auto");
   g_casSdriveStreamMode = false;
   g_casSdriveExactMode = bootMode; // F49U: FUJI/data con gap aplicado por RP2040, estilo SDrive-MAX.
 
-  if (autoSpeed && !g_casAutoAnalysis.valid) casAnalyzeCasFile(path);
-  bool ironProfile = false;
-  uint16_t ironProfileBaud = 600;
+  // F42: resolver perfil efectivo antes del Play. Prioridad:
+  // override manual -> cache de analisis -> AUTO. Si no hay cache, se analiza una vez.
+  String overrideProfile;
+  bool hasProfileOverride = casProfileOverrideGet(g_casMountedName, overrideProfile);
+  CasAutoAnalysis cachedCas;
+  bool casCached = casAutoLoadCacheForPath(path, cachedCas);
+  if (casCached) {
+    memcpy(&g_casAutoAnalysis, &cachedCas, sizeof(CasAutoAnalysis));
+    g_casAutoAnalysis.valid = true;
+  }
+  if (!casCached && !g_casAutoAnalysis.valid) {
+    casAnalyzeCasFile(path);
+  }
+  String effectiveProfile = hasProfileOverride ? overrideProfile : (g_casAutoAnalysis.valid ? String(g_casAutoAnalysis.profile) : String("AUTO"));
+  bool profileDriven = effectiveProfile.length() && effectiveProfile != "AUTO" && effectiveProfile != "NO_ANALIZADO";
+  bool autoSpeed = profileDriven || (reqMode == "auto") || (server.hasArg("auto") && server.arg("auto").toInt() != 0);
+
+  g_casIronTurboCompat = false;
+  g_casIronTurboTurboBaud = 600;
+  g_casAspeqtCompat = false;
   if (autoSpeed) {
-    uint16_t autoBaud = g_casAutoAnalysis.initialBaud ? g_casAutoAnalysis.initialBaud : 600;
-    g_casUserBaseBaud = casClampBaud(autoBaud);
-    g_casTurboMultiplierX100 = 100;
-    g_casTurboEnabled = false;
-    ironProfile = (strncmp(g_casAutoAnalysis.profile, "IRON", 4) == 0) || g_casAutoAnalysis.textIron;
-    ironProfileBaud = g_casAutoAnalysis.turboBaud ? g_casAutoAnalysis.turboBaud : 600;
-    logf("[CAS-AUTO] Play auto profile=%s conf=%s initial=%u turbo=%u", g_casAutoAnalysis.profile, g_casAutoAnalysis.confidence, (unsigned)g_casUserBaseBaud, (unsigned)g_casAutoAnalysis.turboBaud);
+    casApplyEffectiveProfileForPlayback(effectiveProfile, hasProfileOverride);
+    if (effectiveProfile == "AUTO" || effectiveProfile == "NO_ANALIZADO") {
+      uint16_t autoBaud = g_casAutoAnalysis.initialBaud ? g_casAutoAnalysis.initialBaud : 600;
+      g_casUserBaseBaud = casClampBaud(autoBaud);
+      casSetEffectiveProfileRuntime(effectiveProfile, false);
+    }
+    if ((strncmp(g_casAutoAnalysis.profile, "IRON", 4) == 0) || g_casAutoAnalysis.textIron || effectiveProfile == "IRON_STD_600") {
+      g_casIronTurboCompat = true;
+      g_casIronTurboTurboBaud = g_casAutoAnalysis.turboBaud ? casClampBaud(g_casAutoAnalysis.turboBaud) : 600;
+    }
+    logf("[CAS-F42] Play profile=%s manual=%u conf=%s base=%u lock=%u forced=%u turbo=%u",
+         g_casEffectiveProfile, (unsigned)g_casEffectiveProfileManual, g_casAutoAnalysis.confidence,
+         (unsigned)g_casUserBaseBaud, (unsigned)g_casProfileLockBaud, (unsigned)g_casProfileForcedBaud,
+         (unsigned)g_casAutoAnalysis.turboBaud);
   } else {
+    casSetEffectiveProfileRuntime("AUTO", false);
     if (server.hasArg("baud")) g_casUserBaseBaud = casClampBaud(server.arg("baud").toInt());
     else g_casUserBaseBaud = 600;
     if (server.hasArg("mult")) {
@@ -11978,12 +12565,6 @@ void handleCasPlay() {
     } else g_casTurboMultiplierX100 = 100;
     g_casTurboEnabled = server.hasArg("turbo") && server.arg("turbo").toInt() != 0;
   }
-  // F49Z68: IRON_TURBO vuelve como modo automatico conservador.
-  // Si el CAS real es standard 600, NO se fuerza 1200: solo se protege el gap
-  // de reapertura de C:. Los parametros antiguos ?iron/?aspeqt siguen sin UI.
-  g_casIronTurboCompat = autoSpeed && ironProfile;
-  g_casIronTurboTurboBaud = casClampBaud(ironProfileBaud);
-  g_casAspeqtCompat = false;
   if (server.hasArg("delay")) {
     int d = server.arg("delay").toInt();
     if (d < 0) d = 0; if (d > 10) d = 10;
@@ -13388,45 +13969,29 @@ static void webLibraryAppendSaveStatusJson(String& json) {
 }
 
 void handleApiLibraryIndexJson() {
-  // F30: este endpoint debe devolver SIEMPRE un JSON parseable por la UI.
-  // Preferentemente devuelve el arreglo exacto guardado en /CONFIG/library_index.json.
-  // Si el archivo no existe o está truncado, usa el índice en RAM como respaldo.
+  // F42B: devuelve SIEMPRE un array JSON válido. Si /CONFIG/library_index.json
+  // viene con coma final heredada de versiones anteriores, se sanea al vuelo.
   if (!webAtrFsReady()) {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", "[]");
     return;
   }
 
-  String raw;
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_PATH)) {
-    File f = SPIFFS.open(WEB_LIBRARY_INDEX_PATH, "r");
-    if (f) {
-      raw = f.readString();
-      f.close();
-    }
-  }
-  raw.trim();
-
-  String entries = raw;
-  if (entries.startsWith("[")) entries = entries.substring(1);
-  if (entries.endsWith("]")) entries = entries.substring(0, entries.length() - 1);
-  entries.trim();
-
-  bool fileLooksUsable = false;
-  if (raw.length()) {
-    bool bracketOk = raw.startsWith("[") && raw.endsWith("]");
-    bool entriesOk = webLibraryEntriesLooksValid(entries);
-    uint32_t fileCount = webLibraryCountObjects(entries);
-    fileLooksUsable = bracketOk && entriesOk && (fileCount > 0 || g_webLibraryIndexCount == 0);
+  String entries;
+  uint32_t count = 0;
+  bool ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, entries, &count);
+  if (!ok) ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, entries, &count);
+  if (!ok) {
+    entries = webLibraryNormalizedEntriesCopy(g_webLibraryIndexJson);
+    count = webLibraryCountObjects(entries);
+    ok = entries.length() && webLibraryEntriesLooksValid(entries) && count > 0;
   }
 
   String out;
-  if (fileLooksUsable) {
-    out = raw;
-  } else if (g_webLibraryIndexJson.length() && webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
-    out.reserve(g_webLibraryIndexJson.length() + 2);
+  if (ok) {
+    out.reserve(entries.length() + 2);
     out = "[";
-    out += g_webLibraryIndexJson;
+    out += entries;
     out += "]";
   } else {
     out = "[]";
@@ -13444,7 +14009,15 @@ void handleApiLibrary() {
     return;
   }
 
-  bool forceRefresh = (server.hasArg("refresh") && server.arg("refresh") == "1") || (server.hasArg("rebuild") && server.arg("rebuild") == "1");
+  bool refreshArg = (server.hasArg("refresh") && server.arg("refresh") == "1") || (server.hasArg("rebuild") && server.arg("rebuild") == "1");
+  bool manualRefresh = refreshArg && (
+    (server.hasArg("manual") && server.arg("manual") == "1") ||
+    (server.hasArg("confirm") && server.arg("confirm") == "1")
+  );
+  bool forceRefresh = manualRefresh;
+  if (refreshArg && !manualRefresh) {
+    logf("[LIB-IDX] refresh ignorado por no venir con manual=1; usando indice existente");
+  }
   if (!webLibraryIndexEnsure(forceRefresh)) {
     if (forceRefresh) {
       apiSendJsonError(500, "No se pudo construir índice de Biblioteca");
@@ -13464,9 +14037,12 @@ void handleApiLibrary() {
   }
 
   int pageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 0);
-  bool paged = server.hasArg("page") || server.hasArg("offset") || pageSize > 0 || server.hasArg("q") || server.hasArg("type") || server.hasArg("sort");
-  if (pageSize <= 0) pageSize = paged ? 20 : 10000;
-  if (pageSize > 100 && paged) pageSize = 100;
+  // F42E: /api/library vuelve a ser compatible con bibliotecas grandes.
+  // Si no se indica pageSize, se devuelve hasta 10000 entradas. La web/app
+  // puede pedir page/pageSize para paginar, pero no existe límite duro de 100.
+  bool paged = true;
+  if (pageSize <= 0) pageSize = 10000;
+  if (pageSize > 10000) pageSize = 10000;
 
   int page = server.hasArg("page") ? server.arg("page").toInt() : 0;
   if (server.hasArg("offset")) page = server.arg("offset").toInt() / pageSize;
@@ -13474,17 +14050,12 @@ void handleApiLibrary() {
   String q = server.hasArg("q") ? server.arg("q") : String(""); q.toLowerCase();
   String type = server.hasArg("type") ? server.arg("type") : String(""); type.toUpperCase();
 
-  uint32_t totalMatches = 0;
-  String pageEntries;
-  if (paged) {
-    pageEntries.reserve(4096);
-    webLibraryAppendPagedEntries(pageEntries, g_webLibraryIndexJson, page, pageSize, q, type, totalMatches);
-  } else {
-    totalMatches = g_webLibraryIndexCount;
-  }
+  // F42F: saneamos RAM antes de contar/servir y evitamos construir pageEntries completo.
+  webLibraryNormalizeEntriesJson(g_webLibraryIndexJson);
+  uint32_t totalMatches = webLibraryCountMatchingEntries(g_webLibraryIndexJson, q, type);
 
   String json;
-  json.reserve((paged ? pageEntries.length() : 0) + 512);
+  json.reserve(1024);
   json = "{\"ok\":true";
   json += ",\"source\":\"library_index\"";
   json += ",\"refreshed\":" + String(forceRefresh ? "true" : "false");
@@ -13506,19 +14077,11 @@ void handleApiLibrary() {
   server.send(200, "application/json", "");
   server.sendContent(json);
 
-  if (paged) {
-    server.sendContent(pageEntries);
-  } else {
-    // F35: evita duplicar ~30KB o más en otro String. Esto corrige casos donde
-    // total/typeCounts eran correctos pero files[] salía vacío por fragmentación.
-    const int CHUNK = 1024;
-    for (int pos = 0; pos < (int)g_webLibraryIndexJson.length(); pos += CHUNK) {
-      server.sendContent(g_webLibraryIndexJson.substring(pos, pos + CHUNK));
-      delay(0);
-    }
-  }
+  // F42F: streaming seguro de objetos, no de texto prearmado con comas.
+  webLibraryStreamPagedEntries(g_webLibraryIndexJson, page, pageSize, q, type);
 
   server.sendContent("]}");
+  server.client().flush();
 }
 static bool apiMountWebAtrUnit(int unit, const String& requestedFile, String& err) {
   if (!apiValidateDriveUnit(unit)) { err = "Unidad inválida"; return false; }
@@ -15857,6 +16420,8 @@ void setup() {
   server.on("/api/atr/status", HTTP_GET, handleAtrStatus);
   server.on("/api/cas/status", HTTP_GET, handleCasStatus);
   server.on("/api/cas/analyze", HTTP_GET, handleCasAnalyze);
+  server.on("/api/cas/profile", HTTP_GET, handleCasProfile);
+  server.on("/cas/profile", HTTP_GET, handleCasProfile);
   server.on("/cas/mount", HTTP_GET, handleCasMount);
   server.on("/cas/unmount", HTTP_GET, handleCasUnmount);
   server.on("/cas/play", HTTP_GET, handleCasPlay);
