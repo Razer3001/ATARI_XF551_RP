@@ -1,3 +1,16 @@
+// ================================================================
+// VERSION: F24_CODE_CLEAN_STEP1_2026-05-21_1325
+// ARCHIVO: ESP32_Slave_Bridge.ino
+// NOTA: version/build visible al abrir el .ino. Limpieza binaria paso 1: helpers no llamados eliminados.
+// ================================================================
+
+// ================================================================
+// VERSION: F24_CODE_CLEAN_STEP1_2026-05-21_1325
+// ARCHIVO: ESP32_Slave_Bridge.ino
+// ROL: SLAVE
+// NOTA: Versión definida dentro del .ino y visible por Serial.
+// ================================================================
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -7,6 +20,12 @@
 #include "DiskDensityTypes.h"
 #include "EspNowQueueTypes.h"
 #include "BridgeProtocol.h"
+
+static const char SLAVE_BUILD[] = "F24_CODE_CLEAN_STEP1_2026-05-21_1325";
+
+#ifndef TYPE_SUPERDOS_HINT
+#define TYPE_SUPERDOS_HINT 0x42
+#endif
 
 #ifndef ESP_IDF_VERSION_MAJOR
 #define ESP_IDF_VERSION_MAJOR 4
@@ -26,6 +45,9 @@ HardwareSerial SerialSIO(2);
 #define SIO_ERROR    0x45
 
 // ======== Protocolo ESP-NOW ========
+
+enum DriveProfile : uint8_t;
+
 // Tipos TYPE_* , CHUNK_PAYLOAD y PERCOM_* vienen desde BridgeProtocol.h
 #define MAX_SECTOR_BYTES  256
 #define SECTOR_128        128
@@ -64,6 +86,12 @@ static uint32_t g_netDelayUs = 0;
 static uint32_t g_xfSioBaud = 19200;
 static uint32_t g_pendingXfSioBaud = 0;
 
+// V5: deduplicar CFG_UPDATE. La web/Master puede enviar varios ajustes
+// seguidos; durante loaders no queremos reprogramar ni loguear lo mismo.
+static uint32_t g_lastCfgSio = 0;
+static uint32_t g_lastCfgNet = 0;
+static uint8_t  g_lastCfgVflg = 0xFF;
+
 static void applyXfSioBaudNow(uint32_t baud) {
   if (baud < 9600) baud = 9600;
   if (baud > 115200) baud = 115200;
@@ -86,7 +114,8 @@ static const uint8_t  AUTO_READAHEAD_EXTRA = 0; // v16: sin read-ahead automáti
 static const uint8_t  NEXT_TRACK_PRELOAD_THRESHOLD = 0; // v16: next-track preload desactivado
 static const uint8_t  NEXT_TRACK_PRELOAD_SECTORS   = 0; // v16: next-track preload desactivado
 static const uint8_t  BOOT_CACHE_SECTORS          = 3; // Sectores 1-3: cache dedicada de arranque
-static const uint8_t  TRACK_BURST_SECTORS         = 3; // v18: micro-burst dentro de la misma pista
+static const uint8_t  TRACK_BURST_SECTORS         = 3; // micro-burst dentro de la misma pista
+static const uint8_t  TRACK_BURST_MIN_STREAK      = 2; // V6: recién prefetch automático tras 2 lecturas secuenciales
 static const uint8_t  AUTO_READAHEAD_SEQ_EXTRA = 0; // v16: sin secuencia automática
 static const uint32_t SERIAL_DEBUG_BAUD = 460800;
 static const bool LOG_READ_OK = false;
@@ -100,12 +129,60 @@ const uint8_t DEV_MIN = 0x31; // D1
 const uint8_t DEV_MAX = 0x34; // D4
 
 // El SLAVE ya no usa un ID lógico fijo. El MASTER decide D1..D4 por MAC.
-// El SLAVE detecta automáticamente la unidad física real del XF551 (jumpers).
+// El SLAVE detecta automáticamente la unidad física real del drive (jumpers).
 uint8_t g_physicalDev = DEV_MIN;
 volatile uint8_t g_lastLogicDev = DEV_MIN;
 
-const bool supports256 = true;
+enum DriveProfile : uint8_t {
+  PROFILE_XF551 = 0,
+  PROFILE_1050_STOCK = 1,
+  PROFILE_1050_DD_MOD = 2,
+};
+
+static DriveProfile g_driveProfile = PROFILE_XF551;
+static bool supports256 = true;
+static bool g_supportsPercomRW = true;
+static bool g_prefersStatusForDensity = false;
+static bool g_is1050Like = false;
+static bool g_supportsFormat22 = true;
 static bool g_currentDD = false;
+
+static const char* driveProfileName(DriveProfile p) {
+  switch (p) {
+    case PROFILE_1050_STOCK:  return "1050 stock";
+    case PROFILE_1050_DD_MOD: return "1050 DD mod";
+    case PROFILE_XF551:
+    default:                  return "XF551";
+  }
+}
+
+static void applyDriveProfile(DriveProfile p) {
+  g_driveProfile = p;
+  switch (p) {
+    case PROFILE_1050_STOCK:
+      supports256 = false;
+      g_supportsPercomRW = false;
+      g_prefersStatusForDensity = true;
+      g_is1050Like = true;
+      g_supportsFormat22 = true;
+      break;
+    case PROFILE_1050_DD_MOD:
+      supports256 = true;
+      g_supportsPercomRW = false;
+      g_prefersStatusForDensity = true;
+      g_is1050Like = true;
+      g_supportsFormat22 = true;
+      break;
+    case PROFILE_XF551:
+    default:
+      supports256 = true;
+      g_supportsPercomRW = true;
+      g_prefersStatusForDensity = false;
+      g_is1050Like = false;
+      g_supportsFormat22 = true;
+      break;
+  }
+}
 
 // AUTO-DETECCIÓN DE DENSIDAD
 static bool g_diskDensityKnown = false;
@@ -122,6 +199,44 @@ static DiskDensity g_last128Density = DENS_SD;
 static bool g_statusOverrideActive = false;
 static uint8_t g_statusOverride[4] = {0x00, 0xFF, 0xFE, 0x00};
 static uint32_t g_statusOverrideUntilMs = 0;
+
+// Compatibilidad específica para secuencias tipo SuperDOS (PERCOM->FORMAT->WRITE inicial).
+static uint32_t g_superdosCompatUntilMs = 0;
+static uint8_t  g_superdosCompatDev = 0;
+static uint32_t g_lastReadPercomPendingMs = 0;
+static uint8_t  g_lastReadPercomPendingDev = 0;
+static uint32_t g_lastWritePercomAfterPendingMs = 0;
+static uint8_t  g_lastWritePercomAfterPendingDev = 0;
+
+static inline void enableSuperdosCompat(uint8_t devLogic, uint32_t durationMs, const char* reason) {
+  g_superdosCompatDev = devLogic;
+  g_superdosCompatUntilMs = millis() + durationMs;
+  if (reason && *reason) {
+    logf("[COMPAT] SuperDOS compat ON dev=0x%02X por %lums (%s)",
+         devLogic, (unsigned long)durationMs, reason);
+  }
+}
+
+static inline bool superdosCompatIsActive(uint8_t devLogic) {
+  if (g_superdosCompatUntilMs == 0) return false;
+  if (g_superdosCompatDev != 0 && devLogic != 0 && g_superdosCompatDev != devLogic) return false;
+  if ((int32_t)(g_superdosCompatUntilMs - millis()) <= 0) {
+    g_superdosCompatUntilMs = 0;
+    g_superdosCompatDev = 0;
+    return false;
+  }
+  return true;
+}
+
+static inline bool hadRecentPercomPendingSequence(uint8_t devLogic) {
+  if (g_lastReadPercomPendingDev != devLogic) return false;
+  if (g_lastWritePercomAfterPendingDev != devLogic) return false;
+  uint32_t now = millis();
+  if ((now - g_lastReadPercomPendingMs) > 15000UL) return false;
+  if ((now - g_lastWritePercomAfterPendingMs) > 15000UL) return false;
+  if (g_lastWritePercomAfterPendingMs < g_lastReadPercomPendingMs) return false;
+  return true;
+}
 
 static inline const char* densityName(DiskDensity d) {
   switch (d) {
@@ -188,7 +303,8 @@ static inline void buildCleanStatusForDensity(DiskDensity d, uint8_t st[4]) {
 }
 
 static inline void armStatusOverrideForDensity(DiskDensity d, uint32_t durationMs, const char* reason) {
-  if (d == DENS_DD && !g_ddForceActive) d = hostVisibleDensity();
+  if (d != DENS_DD) return;
+  if (!superdosCompatIsActive(g_lastLogicDev)) return;
   buildCleanStatusForDensity(d, g_statusOverride);
   g_statusOverrideActive = true;
   g_statusOverrideUntilMs = millis() + durationMs;
@@ -201,17 +317,7 @@ static inline void armStatusOverrideForDensity(DiskDensity d, uint32_t durationM
   }
 }
 
-static inline uint8_t sectorsRemainingInTrack(uint16_t sec, DiskDensity d) {
-  if (sec <= 3) return 1;
-  uint16_t spt = sectorsPerTrackForDensity(d);
-  if (spt == 0) return 1;
-  uint16_t pos = (uint16_t)((sec - 4) % spt);
-  uint16_t rem = (uint16_t)(spt - pos);
-  if (rem == 0) rem = 1;
-  if (rem > 255) rem = 255;
-  return (uint8_t)rem;
-}
-
+// [F24] Eliminado helper no usado: sectorsRemainingInTrack
 static inline uint16_t trackStartForSector(uint16_t sec, DiskDensity d) {
   if (sec <= 3) return sec;
   uint16_t spt = sectorsPerTrackForDensity(d);
@@ -235,10 +341,13 @@ static bool xfReadStatusRaw(uint8_t out[4], uint8_t aux1, uint8_t aux2);
 static bool xfStatusIndicatesDD(const uint8_t st[4]);
 static const char* xfStatusDensityName(const uint8_t st[4]);
 static bool xfForceDDByPercom(uint8_t devLogical);
+static inline const char* percomModeName(const uint8_t* p);
 bool readPercomFromXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, uint8_t* outBuf);
 bool writePercomToXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, const uint8_t* buf, int len);
 static void runXf551DensityDiagnostics(uint8_t devLogical);
 static void xfDiagProbeSector(uint8_t devLogical, uint16_t sec, DiskDensity mode);
+static void buildSyntheticPercomForProfile(uint8_t outBuf[PERCOM_BLOCK_LEN], DiskDensity d);
+static void logDriveProfileSummary(const char* reason);
 
 
 uint8_t g_lastMaster[6] = {0};
@@ -389,6 +498,8 @@ static uint8_t g_percomAux2 = 0;
 // Último PERCOM escrito por el master y aún relevante para FORMAT/READ PERCOM
 static bool     g_percomPendingValid = false;
 static uint8_t  g_percomPendingBlock[PERCOM_BLOCK_LEN];
+
+// [F24] Eliminado helper no usado: enableSuperdosCompatFromProbe
 static uint8_t  g_percomPendingCmd   = 0;
 static bool     g_percomPendingNeedsReadback = false;
 static uint32_t g_lastPercomWriteMs = 0;
@@ -986,10 +1097,7 @@ static void primeXf551DD(uint8_t devLogical) {
   }
 }
 
-int readSectorFromXF(uint8_t devLogical, uint16_t sec, bool dd, uint8_t* outBuf) {
-  return readSectorFromXFMode(devLogical, sec, dd ? DENS_DD : DENS_SD, outBuf);
-}
-
+// [F24] Eliminado helper no usado: readSectorFromXF
 // ✅✅✅ WRITE con verificación runtime (base 1050c + timings RP_02) ✅✅✅
 bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
                      const uint8_t* buf, int len) {
@@ -1107,9 +1215,65 @@ bool writeSectorToXF(uint8_t devLogical, uint8_t cmd, uint16_t sec, bool dd,
   return false;
 }
 
-// PERCOM READ/WRITE (sin cambios)
+// PERCOM READ/WRITE / síntesis por perfil
+static void buildSyntheticPercomForProfile(uint8_t outBuf[PERCOM_BLOCK_LEN], DiskDensity d) {
+  memset(outBuf, 0, PERCOM_BLOCK_LEN);
+  outBuf[0] = 40;
+  outBuf[1] = 0x04;
+
+  uint16_t spt = 18;
+  uint16_t bps = 128;
+  uint8_t sidesMinusOne = 0x00;
+  uint8_t densityCode = 0x00;
+
+  if (d == DENS_ED) {
+    spt = 26;
+    bps = 128;
+  } else if (d == DENS_DD) {
+    if (supports256) {
+      spt = 18;
+      bps = 256;
+      densityCode = 0x04;
+      if (g_driveProfile == PROFILE_XF551) sidesMinusOne = 0x00;
+    } else {
+      spt = 26;
+      bps = 128;
+    }
+  }
+
+  outBuf[2] = (uint8_t)(spt >> 8);
+  outBuf[3] = (uint8_t)(spt & 0xFF);
+  outBuf[4] = sidesMinusOne;
+  outBuf[5] = densityCode;
+  outBuf[6] = (uint8_t)(bps >> 8);
+  outBuf[7] = (uint8_t)(bps & 0xFF);
+}
+
+static void logDriveProfileSummary(const char* reason) {
+  logf("[PROFILE] %s => %s | PERCOM=%s | 256B=%s | STATUS density=%s | FORMAT22=%s",
+       reason ? reason : "perfil",
+       driveProfileName(g_driveProfile),
+       g_supportsPercomRW ? "sí" : "no",
+       supports256 ? "sí" : "no",
+       g_prefersStatusForDensity ? "sí" : "no",
+       g_supportsFormat22 ? "sí" : "no");
+}
+
 bool readPercomFromXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, uint8_t* outBuf) {
   (void)devLogical;
+  if (!g_supportsPercomRW) {
+    DiskDensity d = hostVisibleDensity();
+    if (d == DENS_UNKNOWN) d = g_prefersStatusForDensity ? DENS_SD : g_last128Density;
+    buildSyntheticPercomForProfile(outBuf, d);
+    logf("[%s] READ PERCOM sintético: mode=%s bps=%u spt=%u sides=%u",
+         driveProfileName(g_driveProfile),
+         percomModeName(outBuf),
+         (unsigned)percomBytesPerSector(outBuf),
+         (unsigned)percomSectorsPerTrack(outBuf),
+         (unsigned)percomSides(outBuf));
+    return true;
+  }
+
   uint8_t frame[5] = { g_physicalDev, 0x4E, aux1, aux2, 0x00 };
   frame[4] = sioChecksum(frame, 4);
 
@@ -1252,6 +1416,24 @@ static bool xfForceDDByPercom(uint8_t devLogical) {
 bool autoDetectDiskDensity() {
   logf("[SLAVE] Auto-detectando densidad del disco...");
 
+  if (g_prefersStatusForDensity) {
+    uint8_t st[4];
+    if (!xfReadStatusRaw(st, 0x00, 0x00)) {
+      logf("[%s] ❌ No se pudo leer STATUS para detectar densidad", driveProfileName(g_driveProfile));
+      return false;
+    }
+    DiskDensity d = (st[0] & 0x80) ? DENS_ED : ((supports256 && (st[0] & 0x20)) ? DENS_DD : DENS_SD);
+    g_diskDensity = d;
+    g_diskDensityKnown = true;
+    g_diskBytesPerSector = densityUses256(d) ? 256 : 128;
+    g_diskSectorsPerTrack = (d == DENS_ED) ? 26 : 18;
+    remember128Density(d);
+    logf("[%s] ✅ Disco detectado por STATUS: %s (%u bytes/sector, spt=%u)",
+         driveProfileName(g_driveProfile), densityName(d),
+         (unsigned)g_diskBytesPerSector, (unsigned)g_diskSectorsPerTrack);
+    return true;
+  }
+
   uint8_t percom[PERCOM_BLOCK_LEN];
   if (!readPercomFromXF(g_lastLogicDev, 0x00, 0x00, percom)) {
     logf("[SLAVE] ❌ No se pudo leer PERCOM del disco");
@@ -1284,13 +1466,7 @@ bool autoDetectDiskDensity() {
   return g_diskDensityKnown;
 }
 
-bool getDiskDD() {
-  if (!g_diskDensityKnown) {
-    autoDetectDiskDensity();
-  }
-  return g_ddForceActive;
-}
-
+// [F24] Eliminado helper no usado: getDiskDD
 static void xfDiagProbeSector(uint8_t devLogical, uint16_t sec, DiskDensity mode) {
   (void)devLogical;
 
@@ -1392,6 +1568,11 @@ void resetDiskDetection() {
 
 bool writePercomToXF(uint8_t devLogical, uint8_t aux1, uint8_t aux2, const uint8_t* buf, int len) {
   (void)devLogical;
+  // Perfiles 1050: aceptar PERCOM a nivel lógico, pero no enviarlo al hardware real.
+  if (!g_supportsPercomRW) {
+    logf("[%s] WRITE PERCOM lógico aceptado (no se envía al hardware)", driveProfileName(g_driveProfile));
+    return true;
+  }
   // Mantener compatibilidad XF551: enviar WRITE PERCOM con AUX=0/0 a la unidad física.
   (void)aux1;
   (void)aux2;
@@ -1453,7 +1634,13 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
   percomWritePending = false;
 
   DiskDensity startMode = dd ? DENS_DD : DENS_SD;
-  if (g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) {
+  // READ_LOADER_V4: si el RP2040 fuerza DD, no dejar que una densidad sticky previa
+  // SD/ED anule el rescate. Esto ayuda cuando la XF551 quedó visible en 128B.
+  if (dd && sec > 3) {
+    startMode = DENS_DD;
+    g_ddForceActive = true;
+    g_lastDdForceMs = millis();
+  } else if (g_diskDensityKnown && g_diskDensity != DENS_UNKNOWN) {
     startMode = g_diskDensity;
   }
 
@@ -1619,11 +1806,14 @@ void handleReadFromMaster(uint8_t devLogic, uint16_t sec, bool dd, uint8_t pfCou
   uint8_t effectivePf = pfCount;
   if (effectivePf == 0 && g_diskDensityKnown) {
     if (sec <= BOOT_CACHE_SECTORS) {
+      // Mantener cache de boot 1-3: mejora arranque sin tocar loaders posteriores.
       effectivePf = BOOT_CACHE_SECTORS;
-    } else {
-      // v18: micro-burst conservador dentro de la misma pista.
-      // Sin precarga de pista siguiente.
+    } else if (seqReadStreak >= TRACK_BURST_MIN_STREAK) {
+      // V6 loader-safe: no leer por adelantado en el primer salto de un loader.
+      // Solo hacemos micro-burst cuando ya hay patrón secuencial real.
       effectivePf = TRACK_BURST_SECTORS;
+    } else {
+      effectivePf = 0;
     }
   }
 
@@ -1738,7 +1928,7 @@ void handleStatusFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2, bool d
 writePending = false;
   percomWritePending = false;
 
-  if (statusOverrideIsActive()) {
+  if (superdosCompatIsActive(devLogic) && statusOverrideIsActive()) {
     sendACK();
     sendSectorChunk(0, g_statusOverride, 4);
     logf("[SLAVE] STATUS lógico limpio enviado: %02X %02X %02X %02X",
@@ -1758,13 +1948,7 @@ writePending = false;
   if (!readFromDrive(st, len, 8000)) { sendNAK(); return; }
 
   DiskDensity visible = hostVisibleDensity();
-  if (visible == DENS_ED) {
-    st[0] |= 0x80;
-    st[2] = 0xE0;
-    st[3] = 0x00;
-    logf("[1050] STATUS normalizado a ED: %02X %02X %02X %02X",
-         st[0], st[1], st[2], st[3]);
-  } else if (visible == DENS_DD) {
+  if (superdosCompatIsActive(devLogic) && visible == DENS_DD) {
     st[0] &= (uint8_t)~0x80;
     st[2] = 0xFE;
     st[3] = 0x00;
@@ -1781,6 +1965,7 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
   g_formatInProgress = true;
 
   uint8_t base = cmd & 0x7F;
+  uint8_t driveCmd = cmd;
 
   int formatReplyLen = SECTOR_128;
 
@@ -1794,18 +1979,31 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
     formatReplyLen = SECTOR_128;
   }
 
+  if (g_is1050Like && !supports256 && g_percomPendingValid) {
+    DiskDensity pendingDensity = percomUses256(g_percomPendingBlock) ? DENS_DD : ((percomSectorsPerTrack(g_percomPendingBlock) == 26) ? DENS_ED : DENS_SD);
+    if (pendingDensity == DENS_ED && base == 0x21 && g_supportsFormat22) {
+      driveCmd = 0x22;
+      formatReplyLen = SECTOR_128;
+      logf("[1050] FORMAT traducido 0x21 -> 0x22 por PERCOM/ED pendiente");
+    }
+  }
+
+  if (g_is1050Like && !supports256 && base == 0x22) {
+    formatReplyLen = SECTOR_128;
+  }
+
   unsigned long timeout = (formatReplyLen >= 256) ? 360000UL : 150000UL;
 
   bool skewHs = (cmd == 0xA1);
-  logf("[XF] FORMAT iniciando cmd=0x%02X base=0x%02X skewHS=%d isDD=%d pending=%d replyLen=%d",
-       cmd, base, skewHs ? 1 : 0, isDD ? 1 : 0, g_percomPendingValid ? 1 : 0, formatReplyLen);
+  logf("[%s] FORMAT iniciando cmd=0x%02X driveCmd=0x%02X base=0x%02X skewHS=%d isDD=%d pending=%d replyLen=%d",
+       driveProfileName(g_driveProfile), cmd, driveCmd, base, skewHs ? 1 : 0, isDD ? 1 : 0, g_percomPendingValid ? 1 : 0, formatReplyLen);
 
   drainSio(100);
 
   uint8_t frame[5];
   frame[0] = g_physicalDev;
-  frame[1] = cmd;
-  // XF551: al invocar FORMAT conviene usar AUX1/AUX2 en cero hacia el drive real.
+  frame[1] = driveCmd;
+  // XF551/1050: al invocar FORMAT conviene usar AUX1/AUX2 en cero hacia el drive real.
   (void)aux1;
   (void)aux2;
   frame[2] = 0x00;
@@ -1880,40 +2078,58 @@ static void formatXF(uint8_t cmd, uint8_t aux1, uint8_t aux2, bool isDD) {
     g_diskSectorsPerTrack = spt;
     g_diskDensity         = (bps >= 256) ? DENS_DD : ((spt == 26) ? DENS_ED : DENS_SD);
     g_diskDensityKnown    = true;
-    remember128Density(g_diskDensity);
+    if (g_diskDensity == DENS_DD) {
+      g_ddForceActive = true;
+      g_lastDdForceMs = millis();
+    } else {
+      remember128Density(g_diskDensity);
+      g_ddForceActive = false;
+    }
     g_percomPendingNeedsReadback = true;
 
     logf("[XF] FORMAT OK - manteniendo PERCOM pendiente: mode=%s",
          percomModeName(g_percomPendingBlock));
+    bool recentPendingSeq = hadRecentPercomPendingSequence(g_lastLogicDev);
+    bool pendingIsDD = percomUses256(g_percomPendingBlock);
+    if (pendingIsDD && recentPendingSeq) {
+      enableSuperdosCompat(g_lastLogicDev, 12000, "READ PERCOM pendiente DD -> WRITE PERCOM -> FORMAT");
+      g_lastWritePercomAfterPendingMs = 0;
+      g_lastWritePercomAfterPendingDev = 0;
+      g_lastReadPercomPendingMs = 0;
+      g_lastReadPercomPendingDev = 0;
+    } else if (pendingIsDD && (superdosCompatIsActive(g_lastLogicDev) || cmd == 0xA1)) {
+      enableSuperdosCompat(g_lastLogicDev, 30000, "FORMAT DD con PERCOM pendiente");
+    } else if (!pendingIsDD) {
+      g_lastWritePercomAfterPendingMs = 0;
+      g_lastWritePercomAfterPendingDev = 0;
+      g_lastReadPercomPendingMs = 0;
+      g_lastReadPercomPendingDev = 0;
+    }
   } else {
     g_diskBytesPerSector  = (formatReplyLen >= 256) ? 256 : 128;
     g_diskSectorsPerTrack = (formatReplyLen >= 256) ? 18 : 18;
     g_diskDensity         = (formatReplyLen >= 256) ? DENS_DD : DENS_SD;
     g_diskDensityKnown    = true;
-    remember128Density(g_diskDensity);
+    if (g_diskDensity == DENS_DD) {
+      g_ddForceActive = true;
+      g_lastDdForceMs = millis();
+    } else {
+      remember128Density(g_diskDensity);
+      g_ddForceActive = false;
+    }
   }
+
+  DiskDensity statusDensity = g_diskDensityKnown ? g_diskDensity : hostVisibleDensity();
+  if (statusDensity == DENS_UNKNOWN) statusDensity = hostVisibleDensity();
 
   sendACK();
   sendSectorChunk(0, buf, formatReplyLen);
-  armStatusOverrideForDensity(hostVisibleDensity(), 6000, "FORMAT OK");
+  armStatusOverrideForDensity(statusDensity, 6000, "FORMAT OK");
   logf("[XF] FORMAT completado len=%d", formatReplyLen);
 }
 
-void handleFormatSD(uint8_t devLogic, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
-  g_lastLogicDev = devLogic;
-  // Acepta cualquier dev lógico: el MASTER decide por MAC
-writePending = false;
-  percomWritePending = false;
-  formatXF(cmd, aux1, aux2, false);  // SD
-}
-void handleFormatDD(uint8_t devLogic, uint8_t cmd, uint8_t aux1, uint8_t aux2) {
-  g_lastLogicDev = devLogic;
-  // Acepta cualquier dev lógico: el MASTER decide por MAC
-writePending = false;
-  percomWritePending = false;
-  formatXF(cmd, aux1, aux2, true);   // DD
-}
-
+// [F24] Eliminado helper no usado: handleFormatSD
+// [F24] Eliminado helper no usado: handleFormatDD
 void handleWriteFromMaster(uint8_t devLogic, uint8_t cmd, uint16_t sec, bool dd) {
   g_lastLogicDev = devLogic;
   // Acepta cualquier dev lógico: el MASTER decide por MAC
@@ -1967,10 +2183,23 @@ void handleReadPercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
     g_diskSectorsPerTrack = spt;
     g_diskDensity         = (bps >= 256) ? DENS_DD : ((spt == 26) ? DENS_ED : DENS_SD);
     g_diskDensityKnown    = true;
-    remember128Density(g_diskDensity);
+    if (g_diskDensity == DENS_DD) {
+      g_ddForceActive = true;
+      g_lastDdForceMs = millis();
+    } else {
+      remember128Density(g_diskDensity);
+      g_ddForceActive = false;
+    }
 
     logf("[SLAVE] READ PERCOM -> devolviendo PENDIENTE: mode=%s bps=%u spt=%u sides=%u",
          percomModeName(buf), (unsigned)bps, (unsigned)spt, (unsigned)sides);
+    if (percomUses256(buf)) {
+      g_lastReadPercomPendingMs = millis();
+      g_lastReadPercomPendingDev = devLogic;
+    } else {
+      g_lastReadPercomPendingMs = 0;
+      g_lastReadPercomPendingDev = 0;
+    }
 
     sendACK();
     sendSectorChunk(PERCOM_SEC_MAGIC, buf, PERCOM_BLOCK_LEN);
@@ -1992,6 +2221,13 @@ void handleReadPercomFromMaster(uint8_t devLogic, uint8_t aux1, uint8_t aux2) {
   g_diskSectorsPerTrack = spt;
   g_diskDensity         = (bps >= 256) ? DENS_DD : ((spt == 26) ? DENS_ED : DENS_SD);
   g_diskDensityKnown    = true;
+  if (g_diskDensity == DENS_DD) {
+    g_ddForceActive = true;
+    g_lastDdForceMs = millis();
+  } else {
+    remember128Density(g_diskDensity);
+    g_ddForceActive = false;
+  }
 
   logf("[SLAVE] READ PERCOM → XF551 real: mode=%s bps=%u spt=%u sides=%u",
        percomModeName(buf), (unsigned)bps, (unsigned)spt, (unsigned)sides);
@@ -2177,12 +2413,19 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
       (percomSectorsPerTrack(currentPercom) == 18) &&
       (percomSides(currentPercom) == 1);
 
-    if (sameCanonicalSD) {
-      logf("[SLAVE] WRITE PERCOM redundante detectado, pero se reenvía igual al XF551 para preparar FORMAT");
-    }
+    bool sameAsPending = g_percomPendingValid &&
+                         memcmp(g_percomPendingBlock, percomApplied, PERCOM_BLOCK_LEN) == 0;
+    bool sameAsCurrent = haveCurrentPercom &&
+                         memcmp(currentPercom, percomApplied, PERCOM_BLOCK_LEN) == 0;
 
-    bool ok = writePercomToXF(percomWriteDev, 0x00, 0x00,
-                              percomApplied, PERCOM_BLOCK_LEN);
+    bool ok = true;
+    if (sameAsPending || sameAsCurrent || sameCanonicalSD) {
+      logf("[SLAVE] WRITE PERCOM redundante: aceptado lógico, sin reescribir hardware (pending=%u current=%u canonSD=%u)",
+           sameAsPending ? 1 : 0, sameAsCurrent ? 1 : 0, sameCanonicalSD ? 1 : 0);
+    } else {
+      ok = writePercomToXF(percomWriteDev, 0x00, 0x00,
+                           percomApplied, PERCOM_BLOCK_LEN);
+    }
 
     if (!ok) {
       percomWritePending = false;
@@ -2195,7 +2438,7 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     g_percomPendingValid = true;
     g_percomPendingCmd = 0x4F;
     g_lastPercomWriteMs = millis();
-    g_percomPendingNeedsReadback = true;
+    g_percomPendingNeedsReadback = !(sameAsPending || sameAsCurrent || sameCanonicalSD);
 
     uint16_t bps = percomBytesPerSector(g_percomPendingBlock);
     uint16_t spt = percomSectorsPerTrack(g_percomPendingBlock);
@@ -2212,6 +2455,17 @@ void handleSectorChunkFromMaster(const uint8_t* in, int len) {
     if (g_diskDensity != DENS_DD) remember128Density(g_diskDensity);
     g_ddForceActive = false;
     clearStatusOverride();
+
+    if (percomUses256(g_percomPendingBlock) &&
+        g_lastReadPercomPendingDev == percomWriteDev &&
+        (millis() - g_lastReadPercomPendingMs) <= 5000UL) {
+      g_lastWritePercomAfterPendingMs = millis();
+      g_lastWritePercomAfterPendingDev = percomWriteDev;
+      logf("[COMPAT] Secuencia PERCOM pendiente DD detectada dev=0x%02X (ventana 15000ms)", percomWriteDev);
+    } else if (!percomUses256(g_percomPendingBlock)) {
+      g_lastWritePercomAfterPendingMs = 0;
+      g_lastWritePercomAfterPendingDev = 0;
+    }
 
     percomWritePending = false;
 
@@ -2231,27 +2485,42 @@ void handleCfgUpdate(const uint8_t* in, int len) {
   uint32_t newNet = getLE32(&in[6]);
   uint8_t  vflg   = in[10];
 
-  g_netDelayUs = (newNet > 20000) ? 20000 : newNet;
-  applyVerifyFlags(vflg);
+  if (newSio < 9600) newSio = 9600;
+  if (newSio > 115200) newSio = 115200;
+  if (newNet > 20000) newNet = 20000;
 
-  // aplica baud solo cuando esté idle (no cortar operaciones)
-  g_pendingXfSioBaud = newSio;
+  bool changed = (newSio != g_lastCfgSio) || (newNet != g_lastCfgNet) || (vflg != g_lastCfgVflg);
 
-  // ACK
+  if (changed) {
+    g_netDelayUs = newNet;
+    applyVerifyFlags(vflg);
+
+    // Aplica baud solo cuando esté idle y solo si realmente cambia.
+    if (newSio != g_xfSioBaud && newSio != g_pendingXfSioBaud) {
+      g_pendingXfSioBaud = newSio;
+    }
+
+    g_lastCfgSio = newSio;
+    g_lastCfgNet = newNet;
+    g_lastCfgVflg = vflg;
+  }
+
+  // ACK siempre, aunque sea duplicado, para que el MASTER no reintente.
   uint8_t ack[12];
   ack[0] = TYPE_CFG_ACK;
   ack[1] = g_physicalDev;
-  ack[2] = 1;              // ok
+  ack[2] = 1;
   ack[3] = g_verifyFlags;
   putLE32(&ack[4], g_pendingXfSioBaud ? g_pendingXfSioBaud : g_xfSioBaud);
   putLE32(&ack[8], g_netDelayUs);
-
   send_now_to(replyMac(), ack, sizeof(ack));
 
-  logf("[CFG] UPDATE vflg=0x%02X netDelayUs=%lu xfSio(pend)=%lu",
-       (unsigned)g_verifyFlags,
-       (unsigned long)g_netDelayUs,
-       (unsigned long)g_pendingXfSioBaud);
+  if (changed) {
+    logf("[CFG] UPDATE vflg=0x%02X netDelayUs=%lu xfSio(pend)=%lu",
+         (unsigned)g_verifyFlags,
+         (unsigned long)g_netDelayUs,
+         (unsigned long)(g_pendingXfSioBaud ? g_pendingXfSioBaud : g_xfSioBaud));
+  }
 }
 
 static void processIncomingPacket(const uint8_t* src, const uint8_t* in, int len) {
@@ -2269,6 +2538,11 @@ static void processIncomingPacket(const uint8_t* src, const uint8_t* in, int len
 
   if (type == TYPE_CFG_UPDATE) {
     handleCfgUpdate(in, len);
+    return;
+  }
+
+  if (type == TYPE_SUPERDOS_HINT && len >= 3) {
+    // v15: ignorar hint en SLAVE para S/E estilo v6
     return;
   }
 
@@ -2380,11 +2654,15 @@ uint8_t detectPhysicalDev() {
 // ======== SETUP / LOOP ========
 void setup() {
   Serial.begin(SERIAL_DEBUG_BAUD);
-  Serial.printf("\n[SLAVE D%u] XF551 WiFi Bridge v2.1 - WEB CFG + ERROR 163 FIXES\n",
+  applyDriveProfile(g_driveProfile);
+  Serial.printf("\n[SLAVE D%u] Atari WiFi Drive Bridge v2.2 - XF551/1050 Profiles\n",
                 (unsigned)(g_lastLogicDev - 0x30));
-  Serial.printf("[SLAVE] Física D%u | DD=%s\n",
-                (unsigned)(g_physicalDev - 0x30),
-                supports256 ? "SÍ" : "NO");
+  Serial.printf("[SLAVE] Perfil por defecto: %s | 256B=%s | PERCOM=%s\n",
+                driveProfileName(g_driveProfile),
+                supports256 ? "SI" : "NO",
+                g_supportsPercomRW ? "SI" : "NO");
+  Serial.print(F("[BUILD] SLAVE="));
+  Serial.println(SLAVE_BUILD);
 
   g_xfSioBaud = 19200;
   SerialSIO.begin((uint32_t)g_xfSioBaud, SERIAL_8N1, SIO_RX, SIO_TX);
@@ -2399,6 +2677,8 @@ void setup() {
 
   pinMode(SIO_COMMAND, OUTPUT);
   digitalWrite(SIO_COMMAND, HIGH);
+
+  logDriveProfileSummary("boot");
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -2431,7 +2711,7 @@ void setup() {
   percomWritePending = false;
 
   markActivity();
-  logf("[SLAVE] ✅ Listo. Esperando comandos... (Serial: X=diag densidad, S=stats)");
+  logf("[SLAVE] ✅ Listo. Esperando comandos... (Serial: X=diag, S=stats, 1=XF551, 2=1050, 3=1050DD, P=perfil)");
 }
 
 void loop() {
@@ -2440,7 +2720,7 @@ void loop() {
 
   // aplicar baud pendiente cuando esté idle (no interrumpir transacción)
   if (g_pendingXfSioBaud != 0 && !g_formatInProgress) {
-    if (isIdleFor(500) && !writePending && !percomWritePending) {
+    if (isIdleFor(2500) && !writePending && !percomWritePending) {
       applyXfSioBaudNow(g_pendingXfSioBaud);
       logf("[CFG] ✅ XF551 SIO baud=%lu", (unsigned long)g_xfSioBaud);
       g_pendingXfSioBaud = 0;
@@ -2473,6 +2753,29 @@ void loop() {
     if (!dequeueRxPacket(pkt)) break;
     if (!pkt.valid) continue;
     processIncomingPacket(pkt.hasSrc ? pkt.src : nullptr, pkt.data, pkt.len);
+  }
+
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c == 'X' || c == 'x') {
+      runXf551DensityDiagnostics(g_lastLogicDev);
+    } else if (c == 'S' || c == 's') {
+      printStats();
+    } else if (c == 'P' || c == 'p') {
+      logDriveProfileSummary("serial");
+    } else if (c == '1') {
+      applyDriveProfile(PROFILE_XF551);
+      resetDiskDetection();
+      logDriveProfileSummary("serial set");
+    } else if (c == '2') {
+      applyDriveProfile(PROFILE_1050_STOCK);
+      resetDiskDetection();
+      logDriveProfileSummary("serial set");
+    } else if (c == '3') {
+      applyDriveProfile(PROFILE_1050_DD_MOD);
+      resetDiskDetection();
+      logDriveProfileSummary("serial set");
+    }
   }
 
   delay(1);

@@ -1,0 +1,5 @@
+Uso recomendado F47 estable:
+python tools\bt_disk_host.py --port COM7 --atr C:\Atari\disk.atr --dev D1 --baud 115200
+
+Para diagnostico detallado por sector:
+python tools\bt_disk_host.py --port COM7 --atr C:\Atari\disk.atr --dev D1 --baud 115200 --verbose

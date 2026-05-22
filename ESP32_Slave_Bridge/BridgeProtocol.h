@@ -10,6 +10,20 @@
 #define TYPE_TIMING_UPDATE 0x30
 #define TYPE_CFG_UPDATE    0x40
 #define TYPE_CFG_ACK       0x41
+#define TYPE_SUPERDOS_HINT 0x42
+
+// Printer 820 / Atari P: (SIO DEV 0x40..0x43)
+#define TYPE_PRINTER_CFG_UPDATE 0x70  // MASTER -> RP2040
+#define TYPE_PRINTER_LINE       0x71  // RP2040 -> MASTER
+#define TYPE_PRINTER_CFG_ACK    0x72
+#define TYPE_PRINTER_DIAG       0x73  // RP2040 -> MASTER printer diagnostic counters  // RP2040 -> MASTER
+#define TYPE_DISK_DIAG          0x74  // RP2040 -> MASTER disk READ/DATA diagnostic
+
+// Cassette manual C: (F49)
+#define TYPE_CAS_CONTROL       0x80  // MASTER -> RP2040: play/stop/rewind/end
+#define TYPE_CAS_DATA          0x81  // MASTER -> RP2040: cassette data bytes
+#define TYPE_CAS_STATUS        0x82  // RP2040 -> MASTER: playback/buffer status
+#define TYPE_CAS_ACK           0x83  // RP2040 -> MASTER: ACK de fragmento cassette
 
 // Códigos SIO Atari
 #define SIO_ACK        0x41

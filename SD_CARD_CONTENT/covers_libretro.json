@@ -1,0 +1,95 @@
+{
+  "source": "Libretro Atari - 8-bit Named_Boxarts",
+  "base": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+  "items": {
+    "montezuma revenge": {
+      "title": "Montezuma's Revenge",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Montezuma%27s%20Revenge%20%281984%29%28Parker%20Brothers%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Montezuma's Revenge (1984)(Parker Brothers)(US).png"
+    },
+    "moon patrol": {
+      "title": "Moon Patrol",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Moon%20Patrol%20%281983%29%28Atari%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Moon Patrol (1983)(Atari)(US).png"
+    },
+    "buck rodgers": {
+      "title": "Buck Rodgers",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Buck%20Rodgers%20%281983%29%28Sega%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Buck Rodgers (1983)(Sega)(US).png"
+    },
+    "buck rogers": {
+      "title": "Buck Rogers",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Buck%20Rogers%20%281983%29%28SEGA%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Buck Rogers (1983)(SEGA)(US).png"
+    },
+    "draconus": {
+      "title": "Draconus",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Draconus%20%281988%29%28Cognito%29%28GB%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Draconus (1988)(Cognito)(GB).png"
+    },
+    "hero": {
+      "title": "H.E.R.O.",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/H.E.R.O.%20%281984%29%28Activision%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "H.E.R.O. (1984)(Activision)(US).png"
+    },
+    "h e r o": {
+      "title": "H.E.R.O.",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/H.E.R.O.%20%281984%29%28Activision%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "H.E.R.O. (1984)(Activision)(US).png"
+    },
+    "pitstop": {
+      "title": "Pitstop",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Pitstop%20%281983%29%28Epyx%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Pitstop (1983)(Epyx)(US).png"
+    },
+    "pitstop ii": {
+      "title": "Pitstop II",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Pitstop%20II%20%281984%29%28Epyx%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Pitstop II (1984)(Epyx)(US).png"
+    },
+    "zybex": {
+      "title": "Zybex",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Zybex%20%281988%29%28Zeppelin%20Games%29%28GB%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Zybex (1988)(Zeppelin Games)(GB).png"
+    },
+    "zorro": {
+      "title": "Zorro",
+      "image": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/Zorro%20%281985%29%28Datasoft%29%28US%29.png",
+      "page": "https://thumbnails.libretro.com/Atari%20-%208-bit/Named_Boxarts/",
+      "source": "Libretro Named_Boxarts",
+      "file": "Zorro (1985)(Datasoft)(US).png"
+    }
+  },
+  "aliases": {
+    "montezuma": "montezuma revenge",
+    "montezumas revenge": "montezuma revenge",
+    "moon patrol arcade": "moon patrol",
+    "buck rodgers": "buck rodgers",
+    "buck rogers": "buck rogers",
+    "hero": "hero",
+    "h e r o": "hero",
+    "pop": "",
+    "prince of persia": "",
+    "zorro": "zorro"
+  }
+}
