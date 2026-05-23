@@ -7,4 +7,5 @@
 struct WebLibraryScanEntry {
   String name;
   String path;
+  uint32_t fileSize = 0;
 };

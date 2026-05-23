@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- BUILD: F21_LIBRARY_MOUNT_NO_RERENDER_2026-05-21_1018 -->
+<!-- BUILD: F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX_2026-05-22_1228 -->
 <html lang="es">
 <head>
 <meta charset="UTF-8" />
@@ -6846,7 +6846,7 @@ let mask = 0;
 for (let i=1;i<=UI_MAX_UNITS;i++) if ($(`${prefix}${i}`)?.checked) mask |= (1 << (i-1));
 return mask;
 }
-const ATR_IMAGE_LOAD_MAX = 1;
+const ATR_IMAGE_LOAD_MAX = 2; // F43F: dos imágenes simultáneas como máximo
 const ATR_THUMB_MISS_TTL_MS_F49Z41 = 30 * 60 * 1000;
 let atrImageLoadActive = 0;
 const atrImageLoadQueue = [];
@@ -7028,7 +7028,7 @@ if (atrLazyCoverObserver) { try { atrLazyCoverObserver.disconnect(); } catch(e){
 if (!list.length) { lib.innerHTML = q ? "Sin resultados para la búsqueda." : "Sin ATRs/XEX cargados."; return; }
 if (mode === "flat") {
 lib.innerHTML = list.map(atrLibraryRowHtml).join("");
-setTimeout(atrInitLazyCovers, 0);
+setTimeout(atrInitLazyCovers, 350);
 return;
 }
 const groups = {};
@@ -7045,7 +7045,7 @@ return `<details class="atr-folder-group">`+
 `<div class="atr-folder-body">${items.map(atrLibraryRowHtml).join("")}</div>`+
 `</details>`;
 }).join("");
-setTimeout(atrInitLazyCovers, 0);
+setTimeout(atrInitLazyCovers, 350);
 }
 let btSioSaveTimer = null;
 let btSioSaving = false;
@@ -8675,7 +8675,24 @@ const maybeFinal = tnfsHandleProgressEvent(evt, name, unit);
 if (maybeFinal) finalEvent = maybeFinal;
 } catch(e) {}
 }
-return finalEvent || { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL" };
+if (finalEvent) return finalEvent;
+// F43G: algunos servidores/navegadores cortan el NDJSON justo antes del evento final.
+// Confirmamos con la ruta JSON normal; si el archivo ya quedó guardado, esta llamada hace SKIP y responde OK.
+try {
+const qs2 = new URLSearchParams(qs);
+qs2.delete("stream");
+tnfsShowProgress("Confirmando descarga TNFS...", 96, true);
+const r2 = await fetch("/api/tnfs/fetch_mount?" + qs2.toString(), { cache:"no-store" });
+const j2 = await r2.json();
+if (j2 && j2.ok) {
+tnfsHandleProgressEvent({ type:"done", phase:"done", ok:1, bytes:Number(j2.bytes||0), message:"TNFS listo." }, name, unit);
+return j2;
+}
+if (j2) return j2;
+} catch(e) {
+return { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL", detail:String((e && e.message) || e) };
+}
+return { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL" };
 }
 async function tnfsDownloadMount(name, unit, sourceButton) {
 name = String(name || "").trim();
@@ -11971,10 +11988,10 @@ body.route-glyphs #printerConfigBlock > :not(#glyphImportExportBlock):not(#glyph
   if(window.__libraryFinalControllerF22)return;
   window.__libraryFinalControllerF22=1;
   window.__libraryFinalControllerF21=1;
-  const TAG='F42G_LIBRARY_MANUAL_REFRESH_GUARD';
+  const TAG='F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX';
   const TYPES=['ALL','ATR','XEX','COM','EXE','BAS','CAS','SEC','OTHER'];
   const MOUNT_TYPES=['ATR','XEX','COM','EXE','SEC'];
-  const state={files:[],payload:null,page:0,pageSize:24,type:'ALL',query:'',sort:'name',refreshing:false,timer:null,lastJsonOk:false,lastJsonCount:0,visibleMask:15,statusMask:0,statusForceMask:0,coverQueue:[],coverActive:0,rendering:false};
+  const state={files:[],payload:null,page:0,pageSize:24,type:'ALL',query:'',sort:'name',refreshing:false,timer:null,lastJsonOk:false,lastJsonCount:0,visibleMask:15,statusMask:0,statusForceMask:0,coverQueue:[],coverActive:0,coverObserver:null,rendering:false,lastLoadAt:0};
   const $=id=>document.getElementById(id);
   const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const enc=v=>encodeURIComponent(String(v==null?'':v));
@@ -11994,7 +12011,7 @@ body.route-glyphs #printerConfigBlock > :not(#glyphImportExportBlock):not(#glyph
   function filtered(){let arr=state.files.slice(); const q=String(state.query||'').trim().toLowerCase(); if(state.type&&state.type!=='ALL')arr=arr.filter(f=>typeOf(f)===state.type); if(q)arr=arr.filter(f=>String(f.name||'').toLowerCase().includes(q)||String(f.path||'').toLowerCase().includes(q)||typeOf(f).toLowerCase().includes(q)); return arr.sort(sorter);}
   function human(n){n=Number(n||0); if(!n)return '—'; if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(n<10240?1:0)+' KB'; return (n/1048576).toFixed(1)+' MB';}
   function maskToUnitsLocal(mask){mask=Number(mask||0); const a=[]; for(let i=1;i<=7;i++)if(mask&(1<<(i-1)))a.push('D'+i); return a.length?a.join('+'):'—';}
-  function isWebAtrMountableFile(f){const t=typeOf(f); const valid=(f&&f.valid==null)?(t==='ATR'):(Number(f&&f.valid||0)!==0); return t==='ATR' ? valid : (MOUNT_TYPES.includes(t)&&valid&&!!(Number(f.sectorSize||0)||Number(f.totalSectors||0)));}
+  function isWebAtrMountableFile(f){const t=typeOf(f); if(!MOUNT_TYPES.includes(t))return false; const valid=(f&&f.valid==null)?1:(Number(f&&f.valid||0)!==0); if(!valid)return false; if(f&&f.mountable!=null)return Number(f.mountable||0)!==0; if(t==='ATR')return true; if(t==='XEX'||t==='COM'||t==='EXE')return Number(f&&f.fileSize||0)>0; return false;}
   function visibleUnits(){let units=[]; let mask=Number(state.visibleMask||15); for(let i=1;i<=7;i++){if(mask & (1<<(i-1)))units.push(i);} if(!units.length)units=[1,2,3,4]; return units;}
   function coverUrl(name){try{if(typeof atrCoverThumbNameSrc==='function')return atrCoverThumbNameSrc(name);}catch(e){} return '/api/covers/thumb?name='+enc(name);}
   function coverFullUrl(name){try{if(typeof atrCoverProxyNameSrc==='function')return atrCoverProxyNameSrc(name);}catch(e){} return '/api/covers/proxy?name='+enc(name);}
@@ -12023,13 +12040,15 @@ body.route-glyphs #printerConfigBlock > :not(#glyphImportExportBlock):not(#glyph
   function card(f){const t=typeOf(f); const sub=esc(f.path&&f.path!==f.name?f.path:noExt(f.name)); return '<article class="mock-lib-card" data-file-name="'+esc(f.name)+'" data-file-path="'+esc(f.path)+'" data-file-type="'+esc(t)+'"><div class="mock-lib-cover-wrap"><span class="mock-lib-type">'+esc(t)+'</span>'+cover(f.name)+'</div><div class="mock-lib-title" title="'+esc(f.name)+'">'+esc(f.name)+'</div><div class="mock-lib-subtitle" title="'+sub+'">'+sub+'</div><div class="mock-lib-meta"><span>'+human(f.fileSize)+'</span><span>'+(t==='CAS'?'Cassette':(f.sectorSize?esc(f.sectorSize+'B'):'—'))+'</span><span>'+(f.totalSectors?esc(f.totalSectors+' sec.'):'—')+'</span>'+(f.protected?'<span>Protegido</span>':'')+'</div>'+casProfileHtml(f)+casProfileControlsHtml(f)+'<div class="mock-lib-units">'+unitsHtml(f)+'</div></article>';}
   function ensureStyle(){if($('libraryF22Style'))return; const st=document.createElement('style'); st.id='libraryF22Style'; st.textContent='#atrLibrary,#atrLibraryPager,body.route-library #mockFilterChipsF27,body.route-library #libraryGridF19,body.route-library #libraryGridF20,body.route-library #libraryGridF21,body.route-library #libraryF19Pager,body.route-library #libraryF20Pager,body.route-library #libraryF21Pager,body.route-library #libraryF19Chips,body.route-library #libraryF20Chips,body.route-library #libraryF21Chips,body.route-library #libraryF19Diag,body.route-library #libraryF20Diag,body.route-library #libraryF21Diag{display:none!important} #libraryF22Chips{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0} #libraryF22Pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;margin:12px 0} #libraryGridF22.mock-lib-grid{display:grid!important;grid-template-columns:repeat(auto-fill,minmax(var(--lib-card-min,220px),1fr));gap:16px!important;margin-top:10px} #libraryF22Diag{font-size:12px;color:#9fb6c8;margin:6px 0 0}.f22-lazy-cover[data-loaded="1"]{display:block}.f22-lazy-cover[data-error="1"]{display:none}.mock-filter-chip[hidden]{display:none!important}'; document.head.appendChild(st);}
   function ensureUi(){ensureStyle(); const block=$('atrLibraryPageBlock'); if(!block)return; ['atrLibrary','atrLibraryPager','libraryGridF19','libraryGridF20','libraryGridF21','libraryF19Pager','libraryF20Pager','libraryF21Pager'].forEach(id=>{const el=$(id); if(el){try{el.innerHTML=''; el.remove();}catch(e){el.style.display='none';}}}); let chips=$('libraryF22Chips'); if(!chips){chips=document.createElement('div'); chips.id='libraryF22Chips'; chips.className='mock-filter-chips'; const row=block.querySelector('.library-refresh-row')||block.querySelector('.library-toolbar-main')||block.firstChild; if(row&&row.parentNode)row.parentNode.insertBefore(chips,row.nextSibling); else block.appendChild(chips);} let diag=$('libraryF22Diag'); if(!diag){diag=document.createElement('div'); diag.id='libraryF22Diag'; chips.parentNode.insertBefore(diag,chips.nextSibling);} let sort=$('atrLibrarySortF22'); if(!sort){const lab=document.createElement('label'); lab.className='label'; lab.style.cssText='display:flex;align-items:center;gap:6px;'; lab.innerHTML='Orden <select id="atrLibrarySortF22" class="small-input"><option value="name">Nombre</option><option value="type">Tipo</option><option value="size">Tamaño</option></select>'; const tb=block.querySelector('.library-toolbar-main')||block; tb.appendChild(lab);} let pager=$('libraryF22Pager'); if(!pager){pager=document.createElement('div'); pager.id='libraryF22Pager'; pager.className='library-pager'; const oldPager=$('libraryF21Pager')||$('libraryF20Pager')||$('libraryF19Pager')||$('atrLibraryPager'); if(oldPager&&oldPager.parentNode)oldPager.parentNode.insertBefore(pager,oldPager.nextSibling); else block.appendChild(pager);} let grid=$('libraryGridF22'); if(!grid){grid=document.createElement('div'); grid.id='libraryGridF22'; grid.className='mock-lib-grid'; const old=$('libraryGridF21')||$('libraryGridF20')||$('libraryGridF19')||$('atrLibrary'); if(old&&old.parentNode)old.parentNode.insertBefore(grid,old); else block.appendChild(grid);} setCoverDefaultAll();}
-  function setCoverDefaultAll(){try{localStorage.setItem('atrCoverModeV29Fix3','all'); localStorage.setItem('atrCoverModeV29','all'); localStorage.setItem('atrCoverModeF22Default','all'); document.body.classList.remove('cover-mode-off'); ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el)el.value='all';}); ['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(id=>{const el=$(id); if(el)el.textContent='Todas lentamente';});}catch(e){}}
+  function setCoverDefaultAll(){try{let mode=localStorage.getItem('atrCoverModeV29Fix3')||localStorage.getItem('atrCoverModeV29')||'manual'; if(mode==='all')mode='visible'; localStorage.setItem('atrCoverModeV29Fix3',mode); localStorage.setItem('atrCoverModeV29',mode); localStorage.setItem('atrCoverModeF43Default','manual'); document.body.classList.toggle('cover-mode-off',mode==='off'); ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el)el.value=mode;}); ['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(id=>{const el=$(id); if(el)el.textContent=(mode==='off'?'Imágenes apagadas':(mode==='manual'?'Manual':'Solo visibles'));});}catch(e){}}
   function updateCounts(c){if(state.type!=='ALL' && !Number(c[state.type]||0)){state.type='ALL'; state.page=0;} ['atrLibraryCount','atrUploadLibraryCount','atrMountLibraryCount','homeLibraryCount'].forEach(id=>{const el=$(id); if(el)el.textContent=state.files.length+' archivo'+(state.files.length===1?'':'s')}); const chips=$('libraryF22Chips'); if(chips){chips.innerHTML=TYPES.filter(t=>t==='ALL'||Number(c[t]||0)>0).map(t=>'<button type="button" class="mock-filter-chip '+(state.type===t?'active':'')+'" data-f22-filter="'+t+'">'+(t==='ALL'?'Todos':t)+' <span>'+Number(c[t]||0)+'</span></button>').join('');}}
   function render(reason){if(!isLibrary())return; ensureUi(); state.rendering=true; try{ const search=$('atrLibrarySearch'); if(search)state.query=search.value||''; const sort=$('atrLibrarySortF22'); if(sort)state.sort=sort.value||state.sort; const grid=$('libraryGridF22'); if(!grid)return; const c=counts(state.files); updateCounts(c); const list=filtered(); const total=list.length; const pages=Math.max(1,Math.ceil(total/state.pageSize)); if(state.page>=pages)state.page=pages-1; if(state.page<0)state.page=0; const start=state.page*state.pageSize; const pageList=list.slice(start,start+state.pageSize); const summary=$('atrLibrarySummary'); if(summary)summary.textContent=(state.files.length?total+' de '+state.files.length+' archivos':'Sin archivos')+' · ATR '+c.ATR+' · XEX '+c.XEX+' · COM '+c.COM+' · EXE '+c.EXE+' · BAS '+c.BAS+' · CAS '+c.CAS+' · unidades visibles '+visibleUnits().map(i=>'D'+i).join(', ')+' · página '+(state.page+1)+'/'+pages; const diag=$('libraryF22Diag'); if(diag)diag.textContent='Render F30 · '+(reason||'')+' · WEB-ATR sync mask=0x'+Number(state.statusMask||0).toString(16).toUpperCase()+' · JSON SD '+(state.lastJsonOk?'OK '+state.lastJsonCount+'/'+(state.payload&&state.payload.indexCount||state.files.length):'pendiente'); const pager=$('libraryF22Pager'); if(pager){pager.innerHTML='<button id="btnLibraryPrevF22" type="button" class="secondary" '+(state.page<=0?'disabled':'')+'>◀ Anterior</button><span class="library-page-info">Página '+(state.page+1)+' / '+pages+' · '+total+' resultado'+(total===1?'':'s')+'</span><button id="btnLibraryNextF22" type="button" class="secondary" '+(state.page>=pages-1?'disabled':'')+'>Siguiente ▶</button><label class="library-page-size">Por página <select id="atrLibraryPageSizeF22" class="small-input"><option value="12">12</option><option value="24">24</option><option value="48">48</option><option value="96">96</option></select></label>'; const ps=$('atrLibraryPageSizeF22'); if(ps)ps.value=String(state.pageSize);} if(!state.files.length)grid.innerHTML='<div class="mock-lib-empty">Sin archivos cargados. Presiona Refrescar biblioteca para construir el índice SD.</div>'; else if(!pageList.length)grid.innerHTML='<div class="mock-lib-empty">Sin resultados para la búsqueda/filtro actual.</div>'; else grid.innerHTML=pageList.map(f=>{try{return card(f)}catch(e){return '<article class="mock-lib-card"><b>'+esc(f&&f.name||'archivo')+'</b><small>Error tarjeta: '+esc(e&&e.message?e.message:e)+'</small></article>'}}).join(''); loadCovers(); populateWebAtr(); } finally {state.rendering=false;} }
   function updateVisibleCardUnits(){const grid=$('libraryGridF22'); if(!grid)return; grid.querySelectorAll('.mock-lib-card').forEach(card=>{const key=card.getAttribute('data-file-path')||card.getAttribute('data-file-name')||''; const f=state.files.find(x=>sameFile(x,key)); const units=card.querySelector('.mock-lib-units'); if(f&&units)units.innerHTML=unitsHtml(f); card.classList.toggle('mounted',!!(f&&(f.mountedMask||f.casMounted)));}); populateWebAtr();}
   function populateWebAtr(){const list=state.files.filter(isWebAtrMountableFile).sort(sorter); const c=counts(list); let html='<option value="">— sin montar — ('+list.length+' archivos)</option><option value="" disabled>Total: '+list.length+' · ATR: '+c.ATR+' · XEX: '+c.XEX+' · COM: '+c.COM+' · EXE: '+c.EXE+'</option>'; list.forEach(f=>html+='<option value="'+esc(fileKey(f))+'">['+esc(typeOf(f))+'] '+esc(f.name)+'</option>'); for(let i=1;i<=7;i++){const sel=$('atrSel'+i); if(sel){const val=sel.value||''; sel.innerHTML=html; if(val)sel.value=val;}}}
-  function loadCovers(){setCoverDefaultAll(); const grid=$('libraryGridF22'); if(!grid)return; const imgs=Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')); imgs.forEach(img=>{if(!img.dataset.queued){img.dataset.queued='1'; state.coverQueue.push(img);}}); pumpCovers();}
-  function pumpCovers(){while(state.coverActive<3&&state.coverQueue.length){const img=state.coverQueue.shift(); if(!img||!document.body.contains(img))continue; state.coverActive++; const done=(ok)=>{state.coverActive=Math.max(0,state.coverActive-1); if(ok){img.dataset.loaded='1'; try{if(typeof atrEnsureMiniCoverFromImage==='function')setTimeout(()=>atrEnsureMiniCoverFromImage(img,img.dataset.title||''),1200)}catch(e){}} else {img.dataset.error='1'; img.style.display='none'; const n=img.nextElementSibling; if(n)n.style.display='flex';} setTimeout(pumpCovers,180);}; img.onload=()=>done(true); img.onerror=()=>done(false); img.src=img.dataset.src;}}
+  function coverMode(){try{return localStorage.getItem('atrCoverModeV29Fix3')||localStorage.getItem('atrCoverModeV29')||'manual'}catch(e){return 'manual'}}
+  function queueCover(img){if(!img||img.dataset.queued||img.dataset.loaded==='1'||img.dataset.error==='1')return; img.dataset.queued='1'; state.coverQueue.push(img); pumpCovers();}
+  function loadCovers(){setCoverDefaultAll(); const grid=$('libraryGridF22'); if(!grid)return; const mode=coverMode(); if(mode==='off'||mode==='manual')return; const imgs=Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')); const start=()=>{ if(mode==='all'){imgs.slice(0,8).forEach(queueCover);return;} if('IntersectionObserver' in window){ if(!state.coverObserver){state.coverObserver=new IntersectionObserver((ents)=>{ents.forEach(en=>{if(en.isIntersecting){try{state.coverObserver.unobserve(en.target)}catch(e){} queueCover(en.target);}})},{root:null,rootMargin:'40px 0px',threshold:0.01});} imgs.forEach(img=>{try{state.coverObserver.observe(img)}catch(e){queueCover(img)}}); } else imgs.slice(0,4).forEach(queueCover); }; setTimeout(start, 550);}
+  function pumpCovers(){while(state.coverActive<2&&state.coverQueue.length){const img=state.coverQueue.shift(); if(!img||!document.body.contains(img))continue; state.coverActive++; const done=(ok)=>{state.coverActive=Math.max(0,state.coverActive-1); if(ok){img.dataset.loaded='1'; try{if(typeof atrEnsureMiniCoverFromImage==='function')setTimeout(()=>atrEnsureMiniCoverFromImage(img,img.dataset.title||''),1800)}catch(e){}} else {img.dataset.error='1'; img.style.display='none'; const n=img.nextElementSibling; if(n)n.style.display='flex';} setTimeout(pumpCovers,450);}; img.onload=()=>done(true); img.onerror=()=>done(false); img.src=img.dataset.src;}}
   function xhrJson(url){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest(); x.open('GET',url,true); x.setRequestHeader('Cache-Control','no-store'); x.onreadystatechange=function(){if(x.readyState!==4)return; let p=null; try{p=JSON.parse(x.responseText||'{}')}catch(e){return reject(new Error('Respuesta JSON inválida en '+url))} if(x.status<200||x.status>=300||(p&&p.ok===false))return reject(new Error((p&&p.error)||('HTTP '+x.status))); resolve(p);}; x.onerror=()=>reject(new Error('Error de red en '+url)); x.send();});}
   async function refreshVisibleMask(){try{const v=await xhrJson('/api/drives/visible?_='+Date.now()); if(v&&v.visibleMask!=null)state.visibleMask=Number(v.visibleMask)||15;}catch(e){}}
   function syncFromAtrStatus(st){if(!st||!Array.isArray(st.slots))return false; if(st.driveVisibleMask!=null)state.visibleMask=Number(st.driveVisibleMask)||state.visibleMask; if(st.mask!=null)state.statusMask=Number(st.mask)||0; if(st.forceMask!=null)state.statusForceMask=Number(st.forceMask)||0; state.files.forEach(f=>{if(MOUNT_TYPES.includes(typeOf(f))){f.mountedMask=0; f.pendingMount=0;}}); st.slots.forEach(sl=>{const unit=Number(sl.unit||0); if(unit<1||unit>7)return; const bit=1<<(unit-1); const nm=String(sl.name||''); if(!nm)return; const active=(Number(sl.enabled||0)||Number(sl.forced||0)||Number(sl.present||0)); if(!active)return; const f=state.files.find(x=>sameFile(x,nm)); if(f)f.mountedMask=Number(f.mountedMask||0)|bit;}); return true;}
@@ -12075,12 +12094,76 @@ body.route-glyphs #printerConfigBlock > :not(#glyphImportExportBlock):not(#glyph
   function logIndex(payload,idx){const expected=Number(payload&&payload.indexCount||payload&&payload.total||state.files.length||0); console.groupCollapsed('[Biblioteca F30] /CONFIG/library_index.json después de Refrescar'); console.log('Respuesta /api/library?refresh=1&manual=1:',payload); console.log('Archivo JSON leído desde SD:',idx); console.log('Verificación cliente:',{jsonReadOk:Array.isArray(idx),jsonCount:Array.isArray(idx)?idx.length:0,expected,match:Array.isArray(idx)&&idx.length===expected}); console.groupEnd();}
   function overlay(){let o=$('libraryRefreshFloatF22'); if(o)return o; o=document.createElement('div'); o.id='libraryRefreshFloatF22'; o.style.cssText='position:fixed;right:18px;bottom:18px;z-index:100000;width:min(390px,calc(100vw - 36px));padding:14px;border:1px solid rgba(56,189,248,.38);border-radius:18px;background:rgba(2,6,23,.97);box-shadow:0 20px 60px rgba(0,0,0,.45);color:#e5f6ff;font:13px system-ui,sans-serif;display:none'; o.innerHTML='<b>Actualizando biblioteca SD...</b><div id="libraryRefreshMsgF22" style="margin-top:6px;color:#a9c6d8">Escaneando...</div><div style="height:10px;border-radius:999px;background:rgba(255,255,255,.12);overflow:hidden;margin-top:10px"><div id="libraryRefreshBarF22" style="height:100%;width:4%;background:linear-gradient(90deg,#38bdf8,#22c55e);transition:width .18s ease"></div></div><div id="libraryRefreshTimeF22" style="margin-top:6px;color:#8fb2c8;font-size:12px">0s</div>'; document.body.appendChild(o); return o;}
   function progress(on,msg){const o=overlay(),bar=$('libraryRefreshBarF22'),m=$('libraryRefreshMsgF22'),t=$('libraryRefreshTimeF22'); if(!on){clearInterval(state.timer); if(bar)bar.style.width='100%'; if(m)m.textContent=msg||'Listo'; if(t)t.textContent='Ver consola para detalle'; setTimeout(()=>o.style.display='none',4200); return;} o.style.display='block'; let pct=4,start=Date.now(); if(bar)bar.style.width='4%'; if(m)m.textContent='Escaneando SD y reconstruyendo índice'; clearInterval(state.timer); state.timer=setInterval(()=>{pct=Math.min(94,pct+(pct<60?3:1)); if(bar)bar.style.width=pct+'%'; if(t)t.textContent='Tiempo transcurrido: '+Math.round((Date.now()-start)/1000)+'s';},650);}
-  async function load(refresh){if(refresh&&state.refreshing)return; ensureUi(); if(refresh){state.refreshing=true; progress(true); const b=$('btnLibraryRefresh'); if(b){b.disabled=true;b.textContent='⏳ Actualizando...';}} try{await refreshVisibleMask(); const p=await xhrJson(refresh?'/api/library?refresh=1&manual=1':'/api/library?refresh=0'); if(p&&p.driveVisibleMask!=null)state.visibleMask=Number(p.driveVisibleMask)||state.visibleMask; let files=Array.isArray(p.files)?p.files:[]; let idx=null; if((!files.length)&&Number(p.indexCount||p.total||0)>0){idx=await readIndexFallback(p.indexCount||p.total); if(Array.isArray(idx)&&idx.length)files=idx;} else if(refresh){idx=await readIndexFallback(p.indexCount||p.total||files.length);} setFiles(files,p); await syncDriveState(); state.page=0; render(refresh?'manual-refresh':'load-index'); if(refresh){await logIndex(p,idx); const ok=Array.isArray(idx)&&idx.length===Number(p.indexCount||files.length); progress(false,'Biblioteca actualizada: '+state.files.length+' archivo(s). '+(ok?'JSON leído OK desde SD.':'Listado cargado; revisar JSON en consola.'));} return p;}catch(e){console.warn(TAG,e&&e.message?e.message:e); if(refresh){progress(false,'Error: '+(e&&e.message?e.message:e)); alert('Error actualizando biblioteca: '+(e&&e.message?e.message:e));} if(state.files.length)render('error-cache'); return null;}finally{if(refresh){state.refreshing=false; const b=$('btnLibraryRefresh'); if(b){b.disabled=false;b.textContent='🔄 Refrescar biblioteca';}}}}
+  async function load(refresh){
+    if(refresh&&state.refreshing)return;
+    ensureUi();
+    if(!refresh&&state.files.length&&Date.now()-Number(state.lastLoadAt||0)<120000){
+      syncDriveState().finally(()=>render('ui-cache-fast'));
+      return state.payload;
+    }
+    if(refresh){
+      state.refreshing=true;
+      progress(true);
+      const b=$('btnLibraryRefresh');
+      if(b){b.disabled=true;b.textContent='⏳ Actualizando...';}
+    }
+    try{
+      await refreshVisibleMask();
+      const pageSize=50;
+      const base=refresh?'/api/library?refresh=1&manual=1':'/api/library?refresh=0';
+      const first=await xhrJson(base+'&page=0&pageSize='+pageSize);
+      if(first&&first.driveVisibleMask!=null)state.visibleMask=Number(first.driveVisibleMask)||state.visibleMask;
+      let files=Array.isArray(first.files)?first.files.slice():[];
+      const total=Number(first&&first.total||first&&first.indexCount||files.length||0);
+      let p=first;
+      // F42J: cargar la Biblioteca por páginas pequeñas. Evita respuestas grandes
+      // que puedan cortar chunked encoding y evita que la UI quede sin listado.
+      for(let pg=1; files.length<total && pg<80; pg++){
+        const nx=await xhrJson('/api/library?refresh=0&page='+pg+'&pageSize='+pageSize);
+        const more=Array.isArray(nx.files)?nx.files:[];
+        if(!more.length)break;
+        files=files.concat(more);
+      }
+      let idx=null;
+      if((!files.length)&&Number(first.indexCount||first.total||0)>0){
+        idx=await readIndexFallback(first.indexCount||first.total);
+        if(Array.isArray(idx)&&idx.length)files=idx;
+      } else if(refresh){
+        // En F42J el refresh normal es seguro/no commit; se valida el JSON solo como diagnóstico.
+        idx=await readIndexFallback(first.indexCount||first.total||files.length);
+      }
+      setFiles(files,first);
+      state.lastLoadAt=Date.now();
+      await syncDriveState();
+      state.page=0;
+      render(refresh?'manual-refresh-safe':'load-index-paged');
+      if(refresh){
+        await logIndex(first,idx);
+        const ok=files.length===Number(first.total||first.indexCount||files.length);
+        progress(false,'Biblioteca actualizada en modo seguro: '+state.files.length+' archivo(s). '+(ok?'Listado paginado OK.':'Listado cargado parcial; revisar consola.'));
+      }
+      return first;
+    }catch(e){
+      console.warn(TAG,e&&e.message?e.message:e);
+      if(refresh){
+        progress(false,'Error: '+(e&&e.message?e.message:e));
+        alert('Error actualizando biblioteca: '+(e&&e.message?e.message:e));
+      }
+      if(state.files.length)render('error-cache');
+      return null;
+    }finally{
+      if(refresh){
+        state.refreshing=false;
+        const b=$('btnLibraryRefresh');
+        if(b){b.disabled=false;b.textContent='🔄 Refrescar biblioteca';}
+      }
+    }
+  }
   async function analyzeCas(file){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; f.pendingAnalyze=true; render('cas-analyze-start'); try{const r=await xhrJson('/api/cas/analyze?file='+enc(file)+'&force=1'); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingAnalyze=false; fx.casAnalyzed=1; fx.casProfile=String(r.profile||''); fx.casAutoProfile=String(r.profile||''); fx.casConfidence=String(r.confidence||''); fx.casEffectiveProfile=String(r.casEffectiveProfile||r.profile||fx.casEffectiveProfile||'AUTO'); fx.casOverride=Number(r.casOverride?1:0); fx.casOverrideProfile=String(r.casOverrideProfile||fx.casOverrideProfile||'AUTO'); fx.casInitialBaud=Number(r.initialBaud||0)||0; fx.casFirstDataBaud=Number(r.firstDataBaud||0)||0; fx.casTurboBaud=Number(r.turboBaud||0)||0; fx.casMaxBaud=Number(r.maxBaud||0)||0; fx.casDataBlocks=Number(r.dataBlocks||0)||0; fx.casBaudChunks=Number(r.baudChunks||0)||0; fx.casFskChunks=Number(r.fskChunks||0)||0; fx.casPwmChunks=Number(r.pwmChunks||0)||0;} try{if(typeof setStatus==='function')setStatus('CAS analizado: '+base(file)+' → '+casProfileLabel((fx&&fx.casEffectiveProfile)||r.profile),true)}catch(e){} render('cas-analyze-ok');}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.pendingAnalyze=false; render('cas-analyze-error'); alert('No se pudo analizar CAS: '+(e&&e.message?e.message:e));}}
   async function setCasProfile(file,profile){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; const old=f.casOverride?f.casOverrideProfile:'AUTO'; f.pendingProfile=true; render('cas-profile-start'); try{const r=await xhrJson('/api/cas/profile?file='+enc(file)+'&profile='+enc(profile)); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingProfile=false; fx.casOverride=Number(r.override?1:0); fx.casOverrideProfile=String(r.overrideProfile||'AUTO'); fx.casEffectiveProfile=String(r.effectiveProfile||fx.casProfile||'AUTO');} try{if(typeof setStatus==='function')setStatus('Perfil CAS guardado: '+base(file)+' → '+casProfileLabel((fx&&fx.casEffectiveProfile)||profile),true)}catch(e){} render('cas-profile-ok');}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingProfile=false; fx.casOverrideProfile=old;} render('cas-profile-error'); alert('No se pudo guardar perfil CAS: '+(e&&e.message?e.message:e));}}
   async function prepareCas(file){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; f.pendingCas=true; updateVisibleCardUnits(); try{const res=await xhrJson('/cas/mount?file='+enc(file)+'&fast=1'); state.files.forEach(x=>{if(typeOf(x)==='CAS'){x.casMounted=0;x.pendingCas=false;}}); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.casMounted=1;fx.pendingCas=false;} try{if(typeof updateCasManualPanelF49==='function')updateCasManualPanelF49(Object.assign({casMounted:1,casPlaying:0,casName:base(file),name:base(file)},res||{}));}catch(e){} try{window.casLastStatusF49J=Object.assign(window.casLastStatusF49J||{},{casMounted:1,mounted:1,casPlaying:0,playing:0,casName:base(file),name:base(file)});}catch(e){} try{if(typeof setStatus==='function')setStatus('C: preparado: '+base(file),true);}catch(e){} updateVisibleCardUnits();}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.pendingCas=false; updateVisibleCardUnits(); alert('No se pudo preparar el cassette: '+(e&&e.message?e.message:e));}}
   async function mountFile(file,unit){const bit=1<<(Number(unit)-1); const f=state.files.find(x=>sameFile(x,file)); if(f){f.pendingMount=unit; updateVisibleCardUnits();} try{await syncDriveState(); const curMask=Number(state.statusMask||0)||0; const curForce=Number(state.statusForceMask||0)||0; const params=new URLSearchParams(); params.set('en','1'); params.set('mask',String(curMask|bit)); params.set('force',String(curForce|bit)); params.set('unit',String(unit)); params.set('file',String(file||'')); params.set('reply','light'); const a=await xhrJson('/set_webatr?'+params.toString()); if(!syncFromAtrStatus(a)){state.files.forEach(x=>{x.pendingMount=0; if(MOUNT_TYPES.includes(typeOf(x)))x.mountedMask=Number(x.mountedMask||0)&(~bit);}); const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.mountedMask=Number(fx.mountedMask||0)|bit; state.statusMask=curMask|bit; state.statusForceMask=curForce|bit;} try{window.lastAtrStatus=Object.assign(window.lastAtrStatus||{},a||{});}catch(e){} try{if(typeof atrApplyLightStatusFast==='function')atrApplyLightStatusFast(a,{forceCovers:false});}catch(e){} try{if(typeof atrSetAutoSaveState==='function')atrSetAutoSaveState('Guardado','ok');}catch(e){} try{if(typeof setStatus==='function')setStatus('Montado en D'+unit+': '+base(file),true);}catch(e){} updateVisibleCardUnits();}catch(e){state.files.forEach(x=>x.pendingMount=0); updateVisibleCardUnits(); alert('No se pudo montar D'+unit+': '+(e&&e.message?e.message:e));}}
-  function bind(){ensureUi(); const old=$('btnLibraryRefresh'); if(old&&!old.dataset.f22Ready){const b=old.cloneNode(true); b.dataset.f22Ready='1'; b.textContent='🔄 Refrescar biblioteca'; old.replaceWith(b); b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();load(true);return false;},true);} const s=$('atrLibrarySearch'); if(s&&!s.dataset.f22Ready){s.dataset.f22Ready='1'; s.addEventListener('input',ev=>{ev.stopPropagation();state.query=s.value||'';state.page=0;render('search');},true);} const sort=$('atrLibrarySortF22'); if(sort&&!sort.dataset.f22Ready){sort.dataset.f22Ready='1'; sort.addEventListener('change',ev=>{ev.stopPropagation();state.sort=sort.value||'name';state.page=0;render('sort');},true);} ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el&&!el.dataset.f22Default){el.dataset.f22Default='1'; el.value='all'; el.addEventListener('change',()=>{try{localStorage.setItem('atrCoverModeV29Fix3',el.value);localStorage.setItem('atrCoverModeV29',el.value);}catch(e){}},true);}});}
+  function bind(){ensureUi(); const old=$('btnLibraryRefresh'); if(old&&!old.dataset.f22Ready){const b=old.cloneNode(true); b.dataset.f22Ready='1'; b.textContent='🔄 Refrescar biblioteca'; old.replaceWith(b); b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();load(true);return false;},true);} const s=$('atrLibrarySearch'); if(s&&!s.dataset.f22Ready){s.dataset.f22Ready='1'; s.addEventListener('input',ev=>{ev.stopPropagation();state.query=s.value||'';state.page=0;render('search');},true);} const sort=$('atrLibrarySortF22'); if(sort&&!sort.dataset.f22Ready){sort.dataset.f22Ready='1'; sort.addEventListener('change',ev=>{ev.stopPropagation();state.sort=sort.value||'name';state.page=0;render('sort');},true);} ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el&&!el.dataset.f22Default){el.dataset.f22Default='1'; el.value=coverMode(); el.addEventListener('change',()=>{try{localStorage.setItem('atrCoverModeV29Fix3',el.value);localStorage.setItem('atrCoverModeV29',el.value);document.body.classList.toggle('cover-mode-off',el.value==='off');['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(pid=>{const pe=$(pid); if(pe)pe.textContent=(el.value==='off'?'Imágenes apagadas':(el.value==='manual'?'Manual':'Solo visibles'));}); if(el.value!=='off'&&el.value!=='manual')loadCovers();}catch(e){}},true);}}); ['btnLoadVisibleCovers','btnLoadVisibleCoversAtr'].forEach(id=>{const b=$(id); if(b&&!b.dataset.f43Ready){b.dataset.f43Ready='1'; b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();localStorage.setItem('atrCoverModeV29Fix3','visible');localStorage.setItem('atrCoverModeV29','visible');setCoverDefaultAll(); const grid=$('libraryGridF22'); if(grid)Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')).slice(0,6).forEach(queueCover); return false;},true);}});}
   document.addEventListener('click',ev=>{const t=ev.target&&ev.target.closest?ev.target.closest('[data-f22-cover],[data-f22-filter],#btnLibraryPrevF22,#btnLibraryNextF22,[data-f22-action]'):null; if(!t)return; ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); if(t.dataset.f22Cover){try{atrOpenCoverFullscreen(t.dataset.full||t.src,t.dataset.title||'')}catch(e){} return false;} if(t.dataset.f22Filter){state.type=String(t.dataset.f22Filter||'ALL').toUpperCase(); if(!TYPES.includes(state.type))state.type='ALL'; state.page=0; render('filter'); return false;} if(t.id==='btnLibraryPrevF22'){state.page=Math.max(0,state.page-1);render('prev');return false;} if(t.id==='btnLibraryNextF22'){state.page++;render('next');return false;} const act=t.dataset.f22Action,file=t.dataset.file||''; if(act==='cas-analyze'){analyzeCas(file);return false;} if(act==='cas'){prepareCas(file);return false;} if(act==='mount'){mountFile(file,Number(t.dataset.unit||1));return false;} if(act==='delete'){if(confirm('¿Eliminar '+file+'?')){if(typeof deleteAtr==='function')deleteAtr(enc(file)); else xhrJson('/atr/delete?file='+enc(file)).then(()=>load(false));}return false;}},true);
   document.addEventListener('change',ev=>{const t=ev.target; if(t&&t.dataset&&t.dataset.f22ProfileFile){ev.preventDefault();ev.stopPropagation();setCasProfile(t.dataset.f22ProfileFile,t.value||'AUTO');return false;} if(t&&t.id==='atrLibraryPageSizeF22'){ev.preventDefault();ev.stopPropagation();state.pageSize=Number(t.value||24)||24;state.page=0;render('page-size');}},true);
   window.renderAtrLibrary=function(files){if(Array.isArray(files)&&files.length){setFiles(files,state.payload);syncDriveState().finally(()=>render('external-nonempty'));}else if(state.files.length&&isLibrary())render('external-empty-guard');}; try{renderAtrLibrary=window.renderAtrLibrary;}catch(e){}
@@ -12096,7 +12179,7 @@ body.route-glyphs #printerConfigBlock > :not(#glyphImportExportBlock):not(#glyph
 </script>
 
 <script id="cacheBuildMarkerF31">
-(function(){try{console.info('F31_LIBRARY_LEGACY_NEUTRALIZED_FIX activo · no debe aparecer Biblioteca F49Z47_TIMEOUT.');}catch(e){}})();
+(function(){try{console.info('F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX activo · XEX/COM/EXE vuelven a montar en D y se mantiene lista rápida/covers diferidos.');}catch(e){}})();
 </script>
 
 </body>

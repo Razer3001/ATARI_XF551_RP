@@ -1,8 +1,8 @@
 // ================================================================
 // ATARI_XF551_RP - ESP32 MASTER
-// BUILD: F42G_LIBRARY_MANUAL_REFRESH_GUARD_2026-05-22_0042
+// BUILD: F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX_2026-05-22_1228
 // DATE : 2026-05-22
-// TIME : 00:42
+// TIME : 10:18
 // ARCHIVO: ESP32_Master_Bridge.ino
 //
 // CAMBIOS VIGENTES:
@@ -24,7 +24,22 @@
 // - F41B: mueve CasProfileOverride a header para compilar correctamente en Arduino IDE.
 // - F42: Play CAS usa perfil efectivo (override/cache) para baud/gaps con fallback seguro.
 // - F42F: /api/library emite files por streaming seguro, sin buffer gigante y sin comas dobles.
-// - F42G: solo refresh manual confirmado reconstruye biblioteca; navegación/cassette no pueden guardar índice vacío.
+// - F42H: rebuild automático nunca puede reducir/limpiar el índice vigente; solo refresh manual confirmado puede hacerlo.
+// - F42I: guardado transaccional del índice: escribe TMP, verifica y recién entonces reemplaza library_index.json.
+// - F42J: navegación Biblioteca en modo solo lectura; refresh no guarda SD salvo commit=1; recuperación automática desde .bak.
+// - F42L: /api/library no declara Content-Length; responde chunked cerrado correctamente para evitar ERR_CONTENT_LENGTH_MISMATCH.
+// - F42M: refresh manual ya no responde 500; si el re-escaneo falla, conserva y sirve índice/backup existente.
+// - F42N: commit=1 devuelve respuesta compacta sin streaming de files[] para evitar ERR_INCOMPLETE_CHUNKED_ENCODING.
+// - F42P: diagnóstico de SD por consola; lista carpetas escaneadas y archivos montables encontrados.
+// - F42S: rebuild/commit usa escaneo seguro y evita copiar String grande antes de guardar.
+// - F42Y: /api/library lista files[] desde escaneo seguro paginado, sin depender de RAM/index JSON.
+// - F43B: cache RAM extendida, payload reducido por defecto y cache de página JSON visible.
+// - F43C: escaneo SD de Biblioteca deshabilitado en navegación/status/cassette; solo botón manual refresca.
+// - F43D: commit=1 también devuelve la página visible files[] usando cache live del botón.
+// - F43E: elimina límites duros de 100 en Biblioteca; el escaneo guarda/lista todos los archivos y la paginación es solo visual.
+// - F43F: acelera Biblioteca usando fileSize del escaneo, evita abrir cada ATR al listar y difiere covers.
+// - F43G: TNFS streaming cierra NDJSON correctamente y agrega fallback para XEX sin evento final.
+// - F43H: restaura montaje Web-ATR para XEX/COM/EXE aunque el payload rápido no incluya sectorSize/totalSectors.
 // ================================================================
 
 #include <Arduino.h>
@@ -189,7 +204,7 @@ static WebStorageAdapter WebStorage;
 
 Preferences prefs;
 
-static const char MASTER_BUILD[] = "F42G_LIBRARY_MANUAL_REFRESH_GUARD_2026-05-22_0042";
+static const char MASTER_BUILD[] = "F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX_2026-05-22_1228";
 
 // ===== Debug =====
 #define MASTER_UART_BYTE_DEBUG 0   // 1 = logea cada byte UART (NO recomendado)
@@ -544,7 +559,7 @@ static bool casAnalyzeCasFile(const String& path);
 static bool webCasLooksLikeName(String name);
 static String webCasPathForName(const String& storedName);
 static String webAtrSanitizeFileName(const String& in);
-static bool webLibraryIndexRebuild(bool saveToFs);
+static bool webLibraryIndexRebuild(bool saveToFs, bool allowShrink);
 
 // ===== CASSETTE AUTO DETECT / CHUNK DIAG F49Z39 =====
 // Analiza FUJI-CAS/A8CAS antes de reproducir para diagnosticar chunks data/baud/fsk/pwm*.
@@ -2019,15 +2034,40 @@ static String webAtrFindExistingInDir(const char* dirPath, const String& storedN
 
 static bool webAtrLibraryScanSkipDir(String path) {
   path.replace("\\", "/");
-  path.toUpperCase();
-  if (path == "/") return false;
-  if (path == "/CONFIG" || path.startsWith("/CONFIG/")) return true;
-  if (path == "/GLYPHS" || path.startsWith("/GLYPHS/")) return true;
-  if (path == "/PRINT" || path.startsWith("/PRINT/")) return true;
-  if (path == "/TMP" || path.startsWith("/TMP/")) return true;
-  if (path == "/COVERS" || path.startsWith("/COVERS/")) return true;
-  if (path == "/MINI_COVERS" || path.startsWith("/MINI_COVERS/")) return true;
-  if (path == "/SYSTEM VOLUME INFORMATION" || path.startsWith("/SYSTEM VOLUME INFORMATION/")) return true;
+  if (!path.length()) return true;
+  if (!path.startsWith("/")) path = String("/") + path;
+
+  String up = path;
+  up.toUpperCase();
+  if (up == "/") return false;
+
+  // F42Q: no recorrer carpetas ocultas/cache. En F42P el diagnóstico entró a
+  // /CAS/.cache y abortó durante el recorrido. Para Biblioteca solo deben
+  // considerarse carpetas de juegos/ATR/CAS, no cachés ni carpetas del sistema.
+  int start = 1;
+  while (start < path.length()) {
+    int slash = path.indexOf('/', start);
+    String part = (slash >= 0) ? path.substring(start, slash) : path.substring(start);
+    if (part.length()) {
+      String partUp = part;
+      partUp.toUpperCase();
+      if (part[0] == '.') return true;          // .cache, .Trash, .Spotlight...
+      if (partUp == "$RECYCLE.BIN") return true;
+      if (partUp.startsWith("FOUND.")) return true;
+      if (partUp == "RECYCLED") return true;
+      if (partUp == "TRASH") return true;
+    }
+    if (slash < 0) break;
+    start = slash + 1;
+  }
+
+  if (up == "/CONFIG" || up.startsWith("/CONFIG/")) return true;
+  if (up == "/GLYPHS" || up.startsWith("/GLYPHS/")) return true;
+  if (up == "/PRINT" || up.startsWith("/PRINT/")) return true;
+  if (up == "/TMP" || up.startsWith("/TMP/")) return true;
+  if (up == "/COVERS" || up.startsWith("/COVERS/")) return true;
+  if (up == "/MINI_COVERS" || up.startsWith("/MINI_COVERS/")) return true;
+  if (up == "/SYSTEM VOLUME INFORMATION" || up.startsWith("/SYSTEM VOLUME INFORMATION/")) return true;
   return false;
 }
 
@@ -2046,6 +2086,7 @@ static String webAtrFindExistingRecursive(const char* dirPath, const String& sto
     String path = f.name();
     path.replace("\\", "/");
     bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
     f.close();
 
     if (path.length() && !path.startsWith("/")) {
@@ -9579,6 +9620,12 @@ static void webAtrPushNameUnique(std::vector<String>& names, String rawName) {
 }
 
 
+// F42P: diagnóstico opcional del escaneo SD por consola.
+// Se activa con /api/library/scan_console o con /api/library?refresh=1&manual=1&console=1.
+// No cambia el índice ni escribe la SD por sí solo; solo imprime lo encontrado.
+static bool     g_webLibraryConsoleScan = false;
+static uint32_t g_webLibraryConsoleScanFound = 0;
+
 // F34: índice de Biblioteca por ruta directa.
 // El diagnóstico /api/fs confirma que /ATR y /CAS sí ven archivos. Para evitar
 // volver a buscar cada nombre desde raíz durante el armado del índice, el escaneo
@@ -9590,7 +9637,7 @@ static bool webLibraryScanEntryContains(const std::vector<WebLibraryScanEntry>& 
   return false;
 }
 
-static void webLibraryPushEntryUnique(std::vector<WebLibraryScanEntry>& entries, String rawPath) {
+static void webLibraryPushEntryUnique(std::vector<WebLibraryScanEntry>& entries, String rawPath, uint32_t rawSize = 0) {
   rawPath.replace("\\", "/");
   rawPath.trim();
   if (!rawPath.length()) return;
@@ -9609,26 +9656,48 @@ static void webLibraryPushEntryUnique(std::vector<WebLibraryScanEntry>& entries,
   WebLibraryScanEntry e;
   e.name = clean;
   e.path = rawPath;
+  e.fileSize = rawSize;
   entries.push_back(e);
+  if (g_webLibraryConsoleScan) {
+    g_webLibraryConsoleScanFound++;
+    String type = webAtrStoredTypeForName(clean);
+    logf("[LIB-SD] FOUND #%lu type=%s name=%s path=%s",
+      (unsigned long)g_webLibraryConsoleScanFound,
+      type.c_str(), clean.c_str(), rawPath.c_str());
+  }
 }
 
 static void webLibraryCollectEntriesRecursive(std::vector<WebLibraryScanEntry>& entries, const char* dirPath, uint8_t depth = 0) {
-  if (!webAtrFsReady() || depth > 6) return;
+  if (!webAtrFsReady() || depth > 6) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] SKIP dir=%s ready=%u depth=%u", dirPath, (unsigned)webAtrFsReady(), (unsigned)depth);
+    return;
+  }
   String baseDir(dirPath);
   if (!baseDir.length()) baseDir = "/";
   baseDir.replace("\\", "/");
   if (!baseDir.startsWith("/")) baseDir = String("/") + baseDir;
-  if (webAtrLibraryScanSkipDir(baseDir)) return;
+  if (webAtrLibraryScanSkipDir(baseDir)) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] SKIP legacy dir=%s", baseDir.c_str());
+    return;
+  }
+  if (g_webLibraryConsoleScan) logf("[LIB-SD] SCAN recursive depth=%u dir=%s", (unsigned)depth, baseDir.c_str());
 
   File root = SPIFFS.open(baseDir, "r");
-  if (!root) return;
-  if (!root.isDirectory()) { root.close(); return; }
+  if (!root) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] OPEN FAIL dir=%s", baseDir.c_str());
+    return;
+  }
+  if (!root.isDirectory()) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] NOT DIR path=%s", baseDir.c_str());
+    root.close(); return;
+  }
 
   File f = root.openNextFile();
   while (f) {
     String path = f.name();
     path.replace("\\", "/");
     bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
     f.close();
 
     if (path.length() && !path.startsWith("/")) {
@@ -9640,7 +9709,7 @@ static void webLibraryCollectEntriesRecursive(std::vector<WebLibraryScanEntry>& 
     if (isDir) {
       if (!webAtrLibraryScanSkipDir(path)) webLibraryCollectEntriesRecursive(entries, path.c_str(), depth + 1);
     } else {
-      webLibraryPushEntryUnique(entries, path);
+      webLibraryPushEntryUnique(entries, path, fSize);
     }
     f = root.openNextFile();
   }
@@ -9648,22 +9717,33 @@ static void webLibraryCollectEntriesRecursive(std::vector<WebLibraryScanEntry>& 
 }
 
 static void webLibraryCollectEntriesShallow(std::vector<WebLibraryScanEntry>& entries, const char* dirPath) {
-  if (!webAtrFsReady()) return;
+  if (!webAtrFsReady()) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] SHALLOW skip, storage not ready dir=%s", dirPath);
+    return;
+  }
   String baseDir(dirPath);
   if (!baseDir.length()) baseDir = "/";
   baseDir.replace("\\", "/");
   if (!baseDir.startsWith("/")) baseDir = String("/") + baseDir;
   if (webAtrLibraryScanSkipDir(baseDir)) return;
+  if (g_webLibraryConsoleScan) logf("[LIB-SD] SCAN shallow dir=%s", baseDir.c_str());
 
   File root = SPIFFS.open(baseDir, "r");
-  if (!root) return;
-  if (!root.isDirectory()) { root.close(); return; }
+  if (!root) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] OPEN FAIL shallow dir=%s", baseDir.c_str());
+    return;
+  }
+  if (!root.isDirectory()) {
+    if (g_webLibraryConsoleScan) logf("[LIB-SD] NOT DIR shallow path=%s", baseDir.c_str());
+    root.close(); return;
+  }
 
   File f = root.openNextFile();
   while (f) {
     String path = f.name();
     path.replace("\\", "/");
     bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
     f.close();
     if (!isDir) {
       if (path.length() && !path.startsWith("/")) {
@@ -9671,7 +9751,7 @@ static void webLibraryCollectEntriesShallow(std::vector<WebLibraryScanEntry>& en
         if (!prefix.endsWith("/")) prefix += "/";
         path = prefix + path;
       }
-      webLibraryPushEntryUnique(entries, path);
+      webLibraryPushEntryUnique(entries, path, fSize);
     }
     f = root.openNextFile();
   }
@@ -9679,6 +9759,11 @@ static void webLibraryCollectEntriesShallow(std::vector<WebLibraryScanEntry>& en
 }
 
 static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries) {
+  if (g_webLibraryConsoleScan) {
+    g_webLibraryConsoleScanFound = 0;
+    logf("[LIB-SD] ===== INICIO ESCANEO SD Biblioteca =====");
+    logf("[LIB-SD] ready=%u backend=%s", (unsigned)webAtrFsReady(), WEB_STORAGE_NAME);
+  }
 #if WEB_STORAGE_USE_SD
   webLibraryCollectEntriesRecursive(entries, "/ATR");
   webLibraryCollectEntriesRecursive(entries, "/CAS");
@@ -9693,9 +9778,17 @@ static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries) 
     WebLibraryScanEntry e;
     e.name = name;
     e.path = webAtrPathForName(name);
+    File nf = SPIFFS.open(e.path, "r");
+    e.fileSize = nf ? (uint32_t)nf.size() : 0;
+    if (nf) nf.close();
     entries.push_back(e);
   }
 #endif
+  if (g_webLibraryConsoleScan) {
+    logf("[LIB-SD] ===== FIN ESCANEO SD Biblioteca: encontrados=%lu entries=%lu =====",
+      (unsigned long)g_webLibraryConsoleScanFound,
+      (unsigned long)entries.size());
+  }
 }
 
 // [F24] Eliminado helper no usado: webAtrCollectFilesFromDir
@@ -9713,6 +9806,7 @@ static void webAtrCollectFilesRecursive(std::vector<String>& names, const char* 
     String path = f.name();
     path.replace("\\", "/");
     bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
     f.close();
     if (path.length() && !path.startsWith("/")) {
       String prefix = baseDir;
@@ -9743,6 +9837,7 @@ static void webAtrCollectFilesShallow(std::vector<String>& names, const char* di
     String path = f.name();
     path.replace("\\", "/");
     bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
     f.close();
     if (!isDir) {
       if (path.length() && !path.startsWith("/")) {
@@ -9811,6 +9906,311 @@ static bool webAtrMoveFile(const String& from, const String& to, String& err) {
     return false;
   }
   SPIFFS.remove(from);
+  return true;
+}
+
+
+
+// F43: cache RAM temporal del escaneo vivo de Biblioteca.
+// F42Y resolvió la estabilidad listando desde SD, pero la web puede pedir page 0/1/2
+// varias veces al entrar. Reusar la lista ya escaneada baja la carga de 3-5 s por página
+// a milisegundos mientras la SD no cambie. No reemplaza al índice persistente ni escribe SD.
+static std::vector<WebLibraryScanEntry> g_webLibraryLiveScanCache;
+static bool     g_webLibraryLiveScanCacheValid = false;
+static uint32_t g_webLibraryLiveScanCacheAtMs = 0;
+static uint32_t g_webLibraryLiveScanCacheBuildMs = 0;
+static const uint32_t WEB_LIBRARY_LIVE_CACHE_TTL_MS = 60000;
+
+// F43B: cache del JSON de página visible. Evita reconstruir files[] si la web
+// pide varias veces la misma página al entrar/salir de Biblioteca.
+static bool     g_webLibraryPageCacheValid = false;
+static String   g_webLibraryPageCacheKey;
+static String   g_webLibraryPageCacheEntries;
+static uint32_t g_webLibraryPageCacheTotal = 0;
+static uint32_t g_webLibraryPageCacheAll = 0;
+static uint32_t g_webLibraryPageCacheAtr = 0;
+static uint32_t g_webLibraryPageCacheXex = 0;
+static uint32_t g_webLibraryPageCacheCom = 0;
+static uint32_t g_webLibraryPageCacheExe = 0;
+static uint32_t g_webLibraryPageCacheBas = 0;
+static uint32_t g_webLibraryPageCacheCas = 0;
+static uint32_t g_webLibraryPageCacheSec = 0;
+static uint32_t g_webLibraryPageCacheOther = 0;
+static uint32_t g_webLibraryPageCacheAtMs = 0;
+static uint32_t g_webLibraryPageCacheScanMs = 0;
+static const uint32_t WEB_LIBRARY_PAGE_CACHE_TTL_MS = 60000;
+// F43E: límite máximo de objetos devueltos en UNA respuesta HTTP de Biblioteca.
+// Esto NO limita el escaneo ni el total encontrado en SD; solo evita respuestas gigantes.
+static const int WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX = 500;
+
+static void webLibraryLiveScanCacheInvalidate(const char* reason) {
+  g_webLibraryLiveScanCache.clear();
+  g_webLibraryLiveScanCacheValid = false;
+  g_webLibraryLiveScanCacheAtMs = 0;
+  g_webLibraryLiveScanCacheBuildMs = 0;
+  g_webLibraryPageCacheValid = false;
+  g_webLibraryPageCacheKey = "";
+  g_webLibraryPageCacheEntries = "";
+  if (reason && reason[0]) logf("[LIB-IDX] F43G live/page cache invalidado: %s", reason);
+}
+
+static bool webLibraryLiveScanCacheGet(std::vector<WebLibraryScanEntry>& out, bool forceRefresh,
+                                       bool& cacheHit, uint32_t& ageMs, uint32_t& buildMs) {
+  cacheHit = false;
+  ageMs = 0;
+  buildMs = 0;
+  if (!webAtrFsReady()) return false;
+
+  uint32_t now = millis();
+  if (g_webLibraryLiveScanCacheValid && !g_webLibraryLiveScanCache.empty() && !forceRefresh) {
+    // F43C: navegación/status/Cassette NO re-escanean SD, aunque el cache
+    // supere el TTL. El cache vive hasta que el usuario presiona Refrescar.
+    ageMs = now - g_webLibraryLiveScanCacheAtMs;
+    out = g_webLibraryLiveScanCache;
+    buildMs = g_webLibraryLiveScanCacheBuildMs;
+    cacheHit = true;
+    return true;
+  }
+
+  if (!forceRefresh) {
+    logf("[LIB-IDX] F43G auto scan bloqueado: cacheValid=%u entries=%lu",
+         (unsigned)g_webLibraryLiveScanCacheValid,
+         (unsigned long)(g_webLibraryLiveScanCacheValid ? g_webLibraryLiveScanCache.size() : 0));
+    return false;
+  }
+
+  uint32_t t0 = millis();
+  std::vector<WebLibraryScanEntry> entries;
+  webLibraryCollectEntries(entries);
+  std::sort(entries.begin(), entries.end(), [](const WebLibraryScanEntry &a, const WebLibraryScanEntry &b) {
+    String aa = webAtrLowerName(a.name);
+    String bb = webAtrLowerName(b.name);
+    int c = aa.compareTo(bb);
+    if (c == 0) return a.path.compareTo(b.path) < 0;
+    return c < 0;
+  });
+
+  buildMs = millis() - t0;
+  if (entries.empty()) {
+    if (g_webLibraryLiveScanCacheValid && !g_webLibraryLiveScanCache.empty()) {
+      out = g_webLibraryLiveScanCache;
+      ageMs = now - g_webLibraryLiveScanCacheAtMs;
+      buildMs = g_webLibraryLiveScanCacheBuildMs;
+      cacheHit = true;
+      logf("[LIB-IDX] F43F live scan manual devolvio 0; se conserva cache entries=%lu", (unsigned long)out.size());
+      return true;
+    }
+    return false;
+  }
+
+  g_webLibraryLiveScanCache = entries;
+  g_webLibraryLiveScanCacheValid = true;
+  g_webLibraryLiveScanCacheAtMs = millis();
+  g_webLibraryLiveScanCacheBuildMs = buildMs;
+  out = entries;
+  ageMs = 0;
+  cacheHit = false;
+  return true;
+}
+
+// F42Y: helper único para convertir una entrada de escaneo SD a objeto JSON de Biblioteca.
+// Se usa para responder /api/library desde escaneo seguro paginado, sin depender
+// de g_webLibraryIndexJson ni de cargar /CONFIG/library_index.json completo a RAM.
+static void webLibraryAppendScanEntryJson(String &j, const WebLibraryScanEntry &entry) {
+  // F43B: payload reducido por defecto. La página de Biblioteca no necesita toda
+  // la metadata CAS ni leer cabeceras ATR en cada render. Si se requiere diagnóstico
+  // completo se puede pedir full=1.
+  const bool full = server.hasArg("full") && server.arg("full") == "1";
+  String name = entry.name;
+  String path = entry.path;
+  String type = webAtrStoredTypeForName(name);
+  bool isCas = (type == "CAS");
+  bool isAtr = (type == "ATR");
+  bool casThisMounted = isCas && g_casMounted && g_casMountedName.equalsIgnoreCase(name);
+
+  // F43F: el listado normal debe ser rápido. El tamaño viene del escaneo SD
+  // (f.size()) y NO se abre cada archivo para leer cabecera ATR. Abrir 50 ATR
+  // por página costaba ~900-1200 ms incluso con cache de lista.
+  uint32_t outFileSize = entry.fileSize;
+  uint16_t outSectorSize = 0;
+  uint32_t outTotalSectors = 0;
+  bool ok = true;
+
+  if (full) {
+    File f2 = SPIFFS.open(path, "r");
+    uint32_t rawSize = f2 ? (uint32_t)f2.size() : outFileSize;
+    if (f2) f2.close();
+    if (isAtr) {
+      WebAtrMeta m;
+      memset(&m, 0, sizeof(m));
+      ok = webAtrReadMetaFromPath(path, m);
+      outFileSize = ok ? m.fileSize : rawSize;
+      outSectorSize = ok ? m.sectorSize : 0;
+      outTotalSectors = ok ? m.totalSectors : 0;
+    } else {
+      outFileSize = rawSize;
+      ok = rawSize > 0;
+    }
+  }
+
+  j += "{\"name\":\"" + jsonEscape(name) + "\"";
+  j += ",\"type\":\"" + type + "\"";
+  j += ",\"protected\":" + String(webAtrIsBundledProtectedName(name) ? 1 : 0);
+  j += ",\"path\":\"" + jsonEscape(path) + "\"";
+  j += ",\"valid\":" + String(ok ? 1 : 0);
+  bool webAtrMountable = false;
+  if (type == "ATR") webAtrMountable = ok;
+  else if ((type == "XEX" || type == "COM" || type == "EXE") && ok && outFileSize > 0) webAtrMountable = true;
+  j += ",\"mountable\":" + String(webAtrMountable ? 1 : 0);
+  j += ",\"fileSize\":" + String(outFileSize);
+  j += ",\"sectorSize\":" + String(outSectorSize);
+  j += ",\"totalSectors\":" + String(outTotalSectors);
+  uint8_t mm = 0;
+  for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) if (g_webAtrMountedName[i] == name) mm |= (1u << i);
+  j += ",\"mountedMask\":" + String(mm);
+  j += ",\"casMounted\":" + String(casThisMounted ? 1 : 0);
+  j += ",\"casPlaying\":" + String((casThisMounted && g_casPlaying) ? 1 : 0);
+  if (isCas) {
+    String casOverrideProfile;
+    bool hasCasOverride = casProfileOverrideGet(name, casOverrideProfile);
+    String casEffectiveProfile = hasCasOverride ? casOverrideProfile : String("AUTO");
+    bool casCached = false;
+    CasAutoAnalysis cachedCas;
+    if (full) {
+      casCached = casAutoLoadCacheForPath(path, cachedCas);
+      if (!hasCasOverride && casCached) casEffectiveProfile = String(cachedCas.profile);
+    }
+    j += ",\"casAnalyzed\":" + String(casCached ? 1 : 0);
+    j += ",\"casOverride\":" + String(hasCasOverride ? 1 : 0);
+    j += ",\"casOverrideProfile\":\"" + jsonEscape(hasCasOverride ? casOverrideProfile : String("AUTO")) + "\"";
+    j += ",\"casEffectiveProfile\":\"" + jsonEscape(casEffectiveProfile) + "\"";
+    if (full && casCached) {
+      j += ",\"casProfile\":\"" + jsonEscape(String(cachedCas.profile)) + "\"";
+      j += ",\"casAutoProfile\":\"" + jsonEscape(String(cachedCas.profile)) + "\"";
+      j += ",\"casConfidence\":\"" + jsonEscape(String(cachedCas.confidence)) + "\"";
+      j += ",\"casSuggestedMode\":\"" + jsonEscape(String(cachedCas.suggestedMode)) + "\"";
+      j += ",\"casInitialBaud\":" + String((unsigned)cachedCas.initialBaud);
+      j += ",\"casFirstDataBaud\":" + String((unsigned)cachedCas.firstDataBaud);
+      j += ",\"casTurboBaud\":" + String((unsigned)cachedCas.turboBaud);
+      j += ",\"casMaxBaud\":" + String((unsigned)cachedCas.maxBaud);
+      j += ",\"casDataBlocks\":" + String((unsigned)cachedCas.dataBlocks);
+      j += ",\"casBaudChunks\":" + String((unsigned)cachedCas.baudChunks);
+      j += ",\"casFskChunks\":" + String((unsigned)cachedCas.fskChunks);
+      j += ",\"casPwmChunks\":" + String((unsigned)cachedCas.pwmChunks);
+    }
+  }
+  j += "}";
+}
+static bool webLibraryEntryMatchesLive(const WebLibraryScanEntry& entry, const String& qLower, const String& typeUpper) {
+  String type = webAtrStoredTypeForName(entry.name);
+  if (typeUpper.length() && typeUpper != "ALL" && type != typeUpper) return false;
+  if (!qLower.length()) return true;
+  String n = entry.name; n.toLowerCase();
+  String p = entry.path; p.toLowerCase();
+  return n.indexOf(qLower) >= 0 || p.indexOf(qLower) >= 0;
+}
+
+static bool webLibraryEntryMatchesLiveSearchOnly(const WebLibraryScanEntry& entry, const String& qLower) {
+  if (!qLower.length()) return true;
+  String n = entry.name; n.toLowerCase();
+  String p = entry.path; p.toLowerCase();
+  return n.indexOf(qLower) >= 0 || p.indexOf(qLower) >= 0;
+}
+
+// F42Y: respuesta visible de /api/library por escaneo seguro paginado.
+// No lee /CONFIG/library_index.json, no toca g_webLibraryIndexJson y no escribe SD.
+static bool webLibraryBuildLiveVisiblePage(int page, int pageSize, const String& qLower, const String& typeUpper,
+                                           String& pageEntries, uint32_t& totalMatches,
+                                           uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
+                                           uint32_t& scanMs) {
+  pageEntries = "";
+  totalMatches = 0;
+  all = atr = xex = com = exe = bas = cas = sec = other = 0;
+  scanMs = 0;
+  if (!webAtrFsReady()) return false;
+  if (page < 0) page = 0;
+  if (pageSize <= 0) pageSize = 50;
+  if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX; // F43E: solo paginación visual, no límite de escaneo
+
+  uint32_t t0 = millis();
+  const bool full = server.hasArg("full") && server.arg("full") == "1";
+  String pageCacheKey = String(page) + "|" + String(pageSize) + "|" + typeUpper + "|" + qLower + "|" + String(full ? 1 : 0);
+  bool forceScan = (server.hasArg("nocache") && server.arg("nocache") == "1") ||
+                   ((server.hasArg("refresh") && server.arg("refresh") == "1") &&
+                    ((server.hasArg("manual") && server.arg("manual") == "1") || (server.hasArg("confirm") && server.arg("confirm") == "1")) &&
+                    !(server.hasArg("commit") && server.arg("commit") == "1"));
+  if (!forceScan && g_webLibraryPageCacheValid && g_webLibraryPageCacheKey == pageCacheKey &&
+      (millis() - g_webLibraryPageCacheAtMs) <= WEB_LIBRARY_PAGE_CACHE_TTL_MS) {
+    pageEntries = g_webLibraryPageCacheEntries;
+    totalMatches = g_webLibraryPageCacheTotal;
+    all = g_webLibraryPageCacheAll;
+    atr = g_webLibraryPageCacheAtr;
+    xex = g_webLibraryPageCacheXex;
+    com = g_webLibraryPageCacheCom;
+    exe = g_webLibraryPageCacheExe;
+    bas = g_webLibraryPageCacheBas;
+    cas = g_webLibraryPageCacheCas;
+    sec = g_webLibraryPageCacheSec;
+    other = g_webLibraryPageCacheOther;
+    scanMs = millis() - t0;
+    logf("[LIB-IDX] F43G page json cache hit page=%d pageSize=%d pageBytes=%u ms=%lu",
+         page, pageSize, (unsigned)pageEntries.length(), (unsigned long)scanMs);
+    return true;
+  }
+
+  std::vector<WebLibraryScanEntry> entries;
+  bool cacheHit = false;
+  uint32_t cacheAgeMs = 0;
+  uint32_t cacheBuildMs = 0;
+  if (!webLibraryLiveScanCacheGet(entries, forceScan, cacheHit, cacheAgeMs, cacheBuildMs)) return false;
+
+  uint32_t startWanted = (uint32_t)page * (uint32_t)pageSize;
+  uint32_t added = 0;
+  pageEntries.reserve(pageSize <= 50 ? 16384 : (pageSize <= 100 ? 32768 : 49152));
+
+  for (const WebLibraryScanEntry& entry : entries) {
+    String type = webAtrStoredTypeForName(entry.name);
+    if (webLibraryEntryMatchesLiveSearchOnly(entry, qLower)) {
+      all++;
+      if (type == "ATR") atr++;
+      else if (type == "XEX") xex++;
+      else if (type == "COM") com++;
+      else if (type == "EXE") exe++;
+      else if (type == "BAS") bas++;
+      else if (type == "CAS") cas++;
+      else if (type == "SEC") sec++;
+      else other++;
+    }
+    if (webLibraryEntryMatchesLive(entry, qLower, typeUpper)) {
+      if (totalMatches >= startWanted && added < (uint32_t)pageSize) {
+        if (pageEntries.length()) pageEntries += ",";
+        webLibraryAppendScanEntryJson(pageEntries, entry);
+        added++;
+      }
+      totalMatches++;
+    }
+    if ((totalMatches & 0x0F) == 0) yield();
+  }
+  scanMs = millis() - t0;
+  g_webLibraryPageCacheValid = true;
+  g_webLibraryPageCacheKey = pageCacheKey;
+  g_webLibraryPageCacheEntries = pageEntries;
+  g_webLibraryPageCacheTotal = totalMatches;
+  g_webLibraryPageCacheAll = all;
+  g_webLibraryPageCacheAtr = atr;
+  g_webLibraryPageCacheXex = xex;
+  g_webLibraryPageCacheCom = com;
+  g_webLibraryPageCacheExe = exe;
+  g_webLibraryPageCacheBas = bas;
+  g_webLibraryPageCacheCas = cas;
+  g_webLibraryPageCacheSec = sec;
+  g_webLibraryPageCacheOther = other;
+  g_webLibraryPageCacheAtMs = millis();
+  g_webLibraryPageCacheScanMs = scanMs;
+  logf("[LIB-IDX] F43G live page ok listCache=%u age=%lu entries=%lu total=%lu page=%d pageSize=%d pageBytes=%u ms=%lu scanBuildMs=%lu full=%u",
+       (unsigned)(cacheHit ? 1 : 0), (unsigned long)cacheAgeMs,
+       (unsigned long)entries.size(), (unsigned long)totalMatches, page, pageSize,
+       (unsigned)pageEntries.length(), (unsigned long)scanMs, (unsigned long)cacheBuildMs, (unsigned)(full ? 1 : 0));
   return true;
 }
 
@@ -9906,6 +10306,8 @@ static const uint32_t WEB_ATR_FILES_CACHE_TTL_MS = 30000UL; // F49Z24: menos esc
 static const char WEB_LIBRARY_INDEX_DIR[] = "/CONFIG";
 static const char WEB_LIBRARY_INDEX_PATH[] = "/CONFIG/library_index.json";
 static const char WEB_LIBRARY_INDEX_BAK_PATH[] = "/CONFIG/library_index.bak.json";
+static const char WEB_LIBRARY_INDEX_TMP_PATH[] = "/CONFIG/library_index.tmp";
+static const char WEB_LIBRARY_INDEX_PREV_PATH[] = "/CONFIG/library_index.prev.json";
 static String   g_webLibraryIndexJson;
 static bool     g_webLibraryIndexLoaded = false;
 static bool     g_webLibraryIndexDirty = false;
@@ -9919,6 +10321,12 @@ static uint32_t g_webLibraryIndexLastSaveMs = 0;
 static uint32_t g_webLibraryIndexLastSavedBytes = 0;
 static uint32_t g_webLibraryIndexLastVerifyCount = 0;
 static String   g_webLibraryIndexLastSaveError;
+
+static bool webLibraryConsoleScanArgEnabled() {
+  return (server.hasArg("console") && server.arg("console") == "1") ||
+         (server.hasArg("log") && server.arg("log") == "1") ||
+         (server.hasArg("serial") && server.arg("serial") == "1");
+}
 
 static uint32_t webLibraryCountObjects(const String& entries) {
   uint32_t count = 0;
@@ -10028,29 +10436,124 @@ static bool webLibraryEnsureConfigDir() {
 
 static bool webLibraryLoadEntriesFromPath(const char* path, String& out, uint32_t* countOut = nullptr) {
   out = "";
+  if (countOut) *countOut = 0;
   if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+
   File f = SPIFFS.open(path, "r");
   if (!f) return false;
-  out = f.readString();
+
+  // F42V: no usar File.readString() NI depender de f.available().
+  // En esta placa se observo: save/verify OK bytes=36686, pero luego
+  // load count=0 len=0. La causa probable es que available() puede iniciar en 0
+  // para FAT/SD aunque f.size() sea correcto. Leemos por tamaño real.
+  uint32_t expectedSize = (uint32_t)f.size();
+  if (expectedSize > 0 && expectedSize < 262144UL) out.reserve(expectedSize + 1);
+
+  char buf[257];
+  uint32_t readBytesTotal = 0;
+  uint16_t idleLoops = 0;
+  if (expectedSize > 0) {
+    f.seek(0);
+    while (readBytesTotal < expectedSize) {
+      uint32_t remain = expectedSize - readBytesTotal;
+      size_t want = remain > 256 ? 256 : (size_t)remain;
+      int n = f.read((uint8_t*)buf, want);
+      if (n <= 0) {
+        if (++idleLoops > 80) break;
+        delay(1);
+        yield();
+        continue;
+      }
+      idleLoops = 0;
+      buf[n] = 0;
+      out += buf;
+      readBytesTotal += (uint32_t)n;
+      if ((readBytesTotal & 0x0FFF) == 0) yield();
+    }
+  } else {
+    // Fallback para FS que no informan size().
+    while (f.available()) {
+      int n = f.read((uint8_t*)buf, 256);
+      if (n <= 0) {
+        if (++idleLoops > 80) break;
+        delay(1);
+        yield();
+        continue;
+      }
+      idleLoops = 0;
+      buf[n] = 0;
+      out += buf;
+      readBytesTotal += (uint32_t)n;
+      if ((readBytesTotal & 0x0FFF) == 0) yield();
+    }
+  }
   f.close();
+
+  if (expectedSize > 0 && readBytesTotal < expectedSize) {
+    logf("[LIB-IDX] load parcial path=%s read=%lu expected=%lu len=%u", path, (unsigned long)readBytesTotal, (unsigned long)expectedSize, (unsigned)out.length());
+  }
+
   webLibraryNormalizeEntriesJson(out);
-  if (!webLibraryEntriesLooksValid(out)) return false;
+  if (!webLibraryEntriesLooksValid(out)) {
+    logf("[LIB-IDX] load invalido path=%s len=%u", path, (unsigned)out.length());
+    return false;
+  }
+
   uint32_t c = webLibraryCountObjects(out);
   if (countOut) *countOut = c;
-  return c > 0;
+  if (c == 0) {
+    logf("[LIB-IDX] load count=0 path=%s len=%u", path, (unsigned)out.length());
+    return false;
+  }
+
+  logf("[LIB-IDX] load ok path=%s count=%lu bytes=%lu/%lu", path, (unsigned long)c, (unsigned long)readBytesTotal, (unsigned long)expectedSize);
+  return true;
+}
+
+static bool webLibraryIndexCopyFile(const char* from, const char* to);
+
+static bool webLibraryIndexLoadBestFromFs(String& bestEntries, uint32_t& bestCount, String* bestSource = nullptr) {
+  bestEntries = "";
+  bestCount = 0;
+  if (bestSource) *bestSource = "";
+
+  const char* paths[] = {
+    WEB_LIBRARY_INDEX_PATH,
+    WEB_LIBRARY_INDEX_BAK_PATH,
+    WEB_LIBRARY_INDEX_PREV_PATH
+  };
+  const char* names[] = { "main", "bak", "prev" };
+
+  for (int i = 0; i < 3; i++) {
+    String e;
+    uint32_t c = 0;
+    if (webLibraryLoadEntriesFromPath(paths[i], e, &c) && c > bestCount) {
+      bestEntries = e;
+      bestCount = c;
+      if (bestSource) *bestSource = names[i];
+    }
+  }
+
+  if (g_webLibraryIndexJson.length() && webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
+    String e = g_webLibraryIndexJson;
+    webLibraryNormalizeEntriesJson(e);
+    uint32_t c = webLibraryCountObjects(e);
+    if (c > bestCount) {
+      bestEntries = e;
+      bestCount = c;
+      if (bestSource) *bestSource = "ram";
+    }
+  }
+  return bestCount > 0;
 }
 
 static bool webLibraryIndexLoadFromFs() {
   uint32_t t0 = millis();
   String entries;
   uint32_t count = 0;
-  bool ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, entries, &count);
-  if (!ok) {
-    // F42G: si el índice principal quedó vacío/corrupto por una versión anterior,
-    // intentar recuperar el último índice bueno desde backup.
-    ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, entries, &count);
-    if (ok) logf("[LIB-IDX] recuperado desde backup count=%u", (unsigned)count);
-  }
+  String source;
+  bool ok = webLibraryIndexLoadBestFromFs(entries, count, &source);
+
   if (!ok) {
     g_webLibraryIndexJson = "";
     g_webLibraryIndexCount = 0;
@@ -10065,16 +10568,27 @@ static bool webLibraryIndexLoadFromFs() {
   g_webLibraryIndexLoaded = true;
   g_webLibraryIndexDirty = false;
   g_webLibraryIndexLoadMs = millis() - t0;
+
+  // F42J: si el índice principal fue dañado/vaciado pero el backup está bueno,
+  // restaurar el principal desde la mejor fuente. Nunca se restaura desde 0.
+  if (source != "main" && count > 0 && webLibraryEnsureConfigDir()) {
+    const char* src = (source == "bak") ? WEB_LIBRARY_INDEX_BAK_PATH : ((source == "prev") ? WEB_LIBRARY_INDEX_PREV_PATH : nullptr);
+    if (src) {
+      bool restored = webLibraryIndexCopyFile(src, WEB_LIBRARY_INDEX_PATH);
+      logf("[LIB-IDX] main restaurado desde %s count=%u ok=%u", source.c_str(), (unsigned)count, (unsigned)restored);
+    }
+  }
+
   return true;
 }
 
-static bool webLibraryIndexVerifyFileStream(uint32_t expectedCount, uint32_t expectedBytes, bool& bracketOk, uint32_t& verifyCount, uint32_t& fileBytes) {
+static bool webLibraryIndexVerifyFileStreamAt(const char* path, uint32_t expectedCount, uint32_t expectedBytes, bool& bracketOk, uint32_t& verifyCount, uint32_t& fileBytes) {
   bracketOk = false;
   verifyCount = 0;
   fileBytes = 0;
-  if (!webAtrFsReady() || !SPIFFS.exists(WEB_LIBRARY_INDEX_PATH)) return false;
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
 
-  File vf = SPIFFS.open(WEB_LIBRARY_INDEX_PATH, "r");
+  File vf = SPIFFS.open(path, "r");
   if (!vf) return false;
   fileBytes = (uint32_t)vf.size();
 
@@ -10105,7 +10619,68 @@ static bool webLibraryIndexVerifyFileStream(uint32_t expectedCount, uint32_t exp
   return bracketOk && sizeOk && countOk;
 }
 
-static bool webLibraryIndexSaveToFs() {
+static bool webLibraryIndexVerifyFileStream(uint32_t expectedCount, uint32_t expectedBytes, bool& bracketOk, uint32_t& verifyCount, uint32_t& fileBytes) {
+  return webLibraryIndexVerifyFileStreamAt(WEB_LIBRARY_INDEX_PATH, expectedCount, expectedBytes, bracketOk, verifyCount, fileBytes);
+}
+
+static bool webLibraryIndexWriteBracketedFile(const char* path, const String& entries, uint32_t& writtenOut) {
+  writtenOut = 0;
+  if (SPIFFS.exists(path)) SPIFFS.remove(path);
+  File f = SPIFFS.open(path, "w");
+  if (!f) return false;
+
+  bool ok = true;
+  size_t w = f.write((const uint8_t*)"[", 1);
+  if (w != 1) ok = false;
+  writtenOut += (uint32_t)w;
+
+  const char* data = entries.c_str();
+  size_t len = entries.length();
+  const size_t CHUNK = 512;
+  for (size_t off = 0; ok && off < len; off += CHUNK) {
+    size_t n = len - off;
+    if (n > CHUNK) n = CHUNK;
+    w = f.write((const uint8_t*)(data + off), n);
+    writtenOut += (uint32_t)w;
+    if (w != n) ok = false;
+    yield();
+  }
+
+  w = f.write((const uint8_t*)"]", 1);
+  if (w != 1) ok = false;
+  writtenOut += (uint32_t)w;
+  f.flush();
+  f.close();
+
+  if (!ok) {
+    if (SPIFFS.exists(path)) SPIFFS.remove(path);
+    return false;
+  }
+  return true;
+}
+
+static bool webLibraryIndexCopyFile(const char* from, const char* to) {
+  File src = SPIFFS.open(from, "r");
+  if (!src) return false;
+  if (SPIFFS.exists(to)) SPIFFS.remove(to);
+  File dst = SPIFFS.open(to, "w");
+  if (!dst) { src.close(); return false; }
+  uint8_t buf[512];
+  bool ok = true;
+  while (src.available()) {
+    int n = src.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    if (dst.write(buf, n) != (size_t)n) { ok = false; break; }
+    yield();
+  }
+  src.close();
+  dst.flush();
+  dst.close();
+  if (!ok && SPIFFS.exists(to)) SPIFFS.remove(to);
+  return ok;
+}
+
+static bool webLibraryIndexSaveToFsFromEntries(const String& entriesIn, uint32_t expectedCount) {
   uint32_t t0 = millis();
   g_webLibraryIndexLastSaveOk = false;
   g_webLibraryIndexLastVerifyOk = false;
@@ -10119,51 +10694,117 @@ static bool webLibraryIndexSaveToFs() {
     return false;
   }
 
-  File f = SPIFFS.open(WEB_LIBRARY_INDEX_PATH, "w");
-  if (!f) {
-    g_webLibraryIndexLastSaveError = "No se pudo abrir library_index.json para escritura";
+  // F42S: evitar duplicar un String grande (~30-40 KB) antes de guardar.
+  // En F42N/O el escaneo encontraba 148 archivos, pero la copia local podia
+  // quedar vacia por fragmentacion/heap y fallaba con local=0 expected=148.
+  // Si entriesIn ya viene como lista interna normalizada ({...},{...}), se usa
+  // directamente por referencia. Solo se crea copia si viene con [ ] externos
+  // o con coma colgante heredada.
+  String entriesNormalizedCopy;
+  const String* entriesPtr = &entriesIn;
+  bool needsNormalizeCopy = entriesIn.startsWith("[") || entriesIn.endsWith("]") || entriesIn.endsWith(",") || (entriesIn.indexOf("},,{") >= 0);
+  if (needsNormalizeCopy) {
+    entriesNormalizedCopy = entriesIn;
+    webLibraryNormalizeEntriesJson(entriesNormalizedCopy);
+    entriesPtr = &entriesNormalizedCopy;
+  }
+  const String& entries = *entriesPtr;
+
+  bool entriesValidForSave = webLibraryEntriesLooksValid(entries);
+  uint32_t localCount = webLibraryCountObjects(entries);
+  if (!entriesValidForSave) {
+    g_webLibraryIndexLastSaveError = "JSON interno inválido antes de guardar índice";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+  if (expectedCount > 0 && localCount != expectedCount) {
+    g_webLibraryIndexLastSaveError = String("RAM/index mismatch antes de guardar: local=") + String(localCount) + " expected=" + String(expectedCount);
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+  if (expectedCount > 0 && entries.length() < 4) {
+    g_webLibraryIndexLastSaveError = "Protegido: no se escribe índice vacío/casi vacío cuando el conteo esperado es mayor que 0";
     g_webLibraryIndexLastSaveMs = millis() - t0;
     return false;
   }
 
-  size_t written = 0;
-  webLibraryNormalizeEntriesJson(g_webLibraryIndexJson);
-  written += f.print("[");
-  written += f.print(g_webLibraryIndexJson);
-  written += f.print("]");
-  f.flush();
-  f.close();
-  g_webLibraryIndexLastSavedBytes = (uint32_t)written;
+  // F42I: guardado transaccional. Primero escribir TMP, verificar TMP,
+  // y solo entonces reemplazar el índice real. Si falla, el índice anterior queda intacto.
+  uint32_t written = 0;
+  if (!webLibraryIndexWriteBracketedFile(WEB_LIBRARY_INDEX_TMP_PATH, entries, written)) {
+    g_webLibraryIndexLastSavedBytes = written;
+    g_webLibraryIndexLastSaveError = "No se pudo escribir library_index.tmp completo";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+  g_webLibraryIndexLastSavedBytes = written;
 
-  delay(10); // F35: da tiempo a SD/FATFS a cerrar/actualizar metadatos antes de verificar.
+  delay(10);
 
   bool bracketOk = false;
   uint32_t verifyCount = 0;
   uint32_t fileBytes = 0;
-  bool valid = webLibraryIndexVerifyFileStream(g_webLibraryIndexCount, g_webLibraryIndexLastSavedBytes, bracketOk, verifyCount, fileBytes);
+  bool tmpValid = webLibraryIndexVerifyFileStreamAt(WEB_LIBRARY_INDEX_TMP_PATH, expectedCount, g_webLibraryIndexLastSavedBytes, bracketOk, verifyCount, fileBytes);
+  if (!tmpValid) {
+    g_webLibraryIndexLastVerifyCount = verifyCount;
+    g_webLibraryIndexLastVerifyOk = false;
+    g_webLibraryIndexLastSaveOk = false;
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    g_webLibraryIndexLastSaveError = String("TMP inválido: bracket=") + String(bracketOk ? 1 : 0) +
+      " count=" + String(verifyCount) + " expected=" + String(expectedCount) +
+      " bytes=" + String(fileBytes) + "/" + String(g_webLibraryIndexLastSavedBytes) +
+      "; índice real conservado";
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_TMP_PATH);
+    return false;
+  }
 
-  g_webLibraryIndexLastVerifyCount = verifyCount;
-  g_webLibraryIndexLastVerifyOk = valid;
-  g_webLibraryIndexLastSaveOk = valid;
-  g_webLibraryIndexLastSaveMs = millis() - t0;
-
-  if (!g_webLibraryIndexLastSaveOk) {
-    g_webLibraryIndexLastSaveError = String("Verificación fallida: bracket=") + String(bracketOk ? 1 : 0) +
-      " count=" + String(verifyCount) + " expected=" + String(g_webLibraryIndexCount) +
-      " bytes=" + String(fileBytes) + "/" + String(g_webLibraryIndexLastSavedBytes);
-  } else {
-    g_webLibraryIndexLastSaveError = "";
-    // F42G: guardar copia de seguridad solo cuando el índice verificado contiene archivos.
-    if (g_webLibraryIndexCount > 0) {
-      File bf = SPIFFS.open(WEB_LIBRARY_INDEX_BAK_PATH, "w");
-      if (bf) {
-        bf.print("[");
-        bf.print(g_webLibraryIndexJson);
-        bf.print("]");
-        bf.flush();
-        bf.close();
-      }
+  // Reemplazo con posibilidad de rollback simple.
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_PREV_PATH);
+  bool hadMain = SPIFFS.exists(WEB_LIBRARY_INDEX_PATH);
+  if (hadMain) {
+    if (!SPIFFS.rename(WEB_LIBRARY_INDEX_PATH, WEB_LIBRARY_INDEX_PREV_PATH)) {
+      // Si rename falla en alguna SD, intentamos al menos copiar el índice anterior.
+      webLibraryIndexCopyFile(WEB_LIBRARY_INDEX_PATH, WEB_LIBRARY_INDEX_PREV_PATH);
+      SPIFFS.remove(WEB_LIBRARY_INDEX_PATH);
     }
+  }
+
+  bool promoted = SPIFFS.rename(WEB_LIBRARY_INDEX_TMP_PATH, WEB_LIBRARY_INDEX_PATH);
+  if (!promoted) promoted = webLibraryIndexCopyFile(WEB_LIBRARY_INDEX_TMP_PATH, WEB_LIBRARY_INDEX_PATH);
+
+  bool finalBracketOk = false;
+  uint32_t finalVerifyCount = 0;
+  uint32_t finalFileBytes = 0;
+  bool finalValid = promoted && webLibraryIndexVerifyFileStreamAt(WEB_LIBRARY_INDEX_PATH, expectedCount, g_webLibraryIndexLastSavedBytes, finalBracketOk, finalVerifyCount, finalFileBytes);
+
+  if (!finalValid) {
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_PATH);
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_PREV_PATH)) SPIFFS.rename(WEB_LIBRARY_INDEX_PREV_PATH, WEB_LIBRARY_INDEX_PATH);
+    g_webLibraryIndexLastVerifyCount = finalVerifyCount;
+    g_webLibraryIndexLastVerifyOk = false;
+    g_webLibraryIndexLastSaveOk = false;
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    g_webLibraryIndexLastSaveError = String("Promoción fallida/rollback: bracket=") + String(finalBracketOk ? 1 : 0) +
+      " count=" + String(finalVerifyCount) + " expected=" + String(expectedCount) +
+      " bytes=" + String(finalFileBytes) + "/" + String(g_webLibraryIndexLastSavedBytes);
+    return false;
+  }
+
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_TMP_PATH);
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_PREV_PATH);
+
+  g_webLibraryIndexJson = entries;
+  g_webLibraryIndexCount = expectedCount;
+  g_webLibraryIndexLastVerifyCount = finalVerifyCount;
+  g_webLibraryIndexLastVerifyOk = true;
+  g_webLibraryIndexLastSaveOk = true;
+  g_webLibraryIndexLastSaveMs = millis() - t0;
+  g_webLibraryIndexLastSaveError = "";
+
+  // F42G/F42I: backup solo desde un índice final verificado y con archivos.
+  if (expectedCount > 0) {
+    uint32_t bakWritten = 0;
+    webLibraryIndexWriteBracketedFile(WEB_LIBRARY_INDEX_BAK_PATH, entries, bakWritten);
   }
 
   logf("[LIB-IDX] save ok=%u verify=%u bytes=%lu count=%lu/%lu ms=%lu err=%s",
@@ -10171,40 +10812,50 @@ static bool webLibraryIndexSaveToFs() {
     (unsigned)g_webLibraryIndexLastVerifyOk,
     (unsigned long)g_webLibraryIndexLastSavedBytes,
     (unsigned long)g_webLibraryIndexLastVerifyCount,
-    (unsigned long)g_webLibraryIndexCount,
+    (unsigned long)expectedCount,
     (unsigned long)g_webLibraryIndexLastSaveMs,
     g_webLibraryIndexLastSaveError.c_str());
 
   return g_webLibraryIndexLastSaveOk;
 }
 
-static bool webLibraryIndexRebuild(bool saveToFs = true) {
+static bool webLibraryIndexSaveToFs() {
+  return webLibraryIndexSaveToFsFromEntries(g_webLibraryIndexJson, g_webLibraryIndexCount);
+}
+
+static bool webLibraryIndexRebuild(bool saveToFs = true, bool allowShrink = false) {
   if (!webAtrFsReady()) return false;
   uint32_t t0 = millis();
   String tmp;
   tmp.reserve(g_webAtrFilesJsonCache.length() ? g_webAtrFilesJsonCache.length() : 4096);
+  // F42S: webAtrAppendFileListJson() usa webLibraryCollectEntries(), que ahora
+  // comparte el skip seguro validado por /api/library/scan_console: no entra
+  // a .cache, /CONFIG, /TMP, COVERS ni carpetas del sistema.
   webAtrAppendFileListJson(tmp);
   webLibraryNormalizeEntriesJson(tmp);
 
   bool entriesValid = webLibraryEntriesLooksValid(tmp);
   uint32_t newCount = webLibraryCountObjects(tmp);
 
+  // F42H: capturar índice vigente/backup ANTES de decidir reemplazar.
+  // Cualquier reconstrucción no manual que devuelva 0 o menos archivos que
+  // el índice vigente se considera parcial/accidental y no reemplaza RAM ni SD.
+  String oldEntriesF42H;
+  uint32_t oldCountF42H = 0;
+  if (g_webLibraryIndexLoaded && g_webLibraryIndexJson.length() && webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
+    oldEntriesF42H = g_webLibraryIndexJson;
+    oldCountF42H = webLibraryCountObjects(oldEntriesF42H);
+  }
+  if (oldCountF42H == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, oldEntriesF42H, &oldCountF42H);
+  if (oldCountF42H == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, oldEntriesF42H, &oldCountF42H);
+
   // F42G: jamás reemplazar en RAM ni en SD un índice bueno por [] durante
   // navegación normal, salida de Cassette o refresh accidental. Si el escaneo
   // devuelve cero, se conserva RAM -> índice principal -> backup.
   if (newCount == 0) {
-    String oldEntries;
-    uint32_t oldCount = 0;
-    if (g_webLibraryIndexLoaded && g_webLibraryIndexJson.length() && webLibraryEntriesLooksValid(g_webLibraryIndexJson)) {
-      oldEntries = g_webLibraryIndexJson;
-      oldCount = webLibraryCountObjects(oldEntries);
-    }
-    if (oldCount == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, oldEntries, &oldCount);
-    if (oldCount == 0) webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, oldEntries, &oldCount);
-
-    if (oldCount > 0) {
-      g_webLibraryIndexJson = oldEntries;
-      g_webLibraryIndexCount = oldCount;
+    if (oldCountF42H > 0) {
+      g_webLibraryIndexJson = oldEntriesF42H;
+      g_webLibraryIndexCount = oldCountF42H;
       g_webLibraryIndexBuildMs = millis() - t0;
       g_webLibraryIndexLoaded = true;
       g_webLibraryIndexDirty = false;
@@ -10227,6 +10878,21 @@ static bool webLibraryIndexRebuild(bool saveToFs = true) {
     g_webLibraryIndexLastSaveError = "Escaneo devolvio 0 archivos; no se guarda indice vacio";
     logf("[LIB-IDX] rebuild scan=0 sin indice previo; no se guarda []");
     return false;
+  }
+
+  if (!allowShrink && oldCountF42H > 0 && newCount < oldCountF42H) {
+    g_webLibraryIndexJson = oldEntriesF42H;
+    g_webLibraryIndexCount = oldCountF42H;
+    g_webLibraryIndexBuildMs = millis() - t0;
+    g_webLibraryIndexLoaded = true;
+    g_webLibraryIndexDirty = false;
+    g_webLibraryIndexLastSaveOk = true;
+    g_webLibraryIndexLastVerifyOk = true;
+    g_webLibraryIndexLastVerifyCount = g_webLibraryIndexCount;
+    g_webLibraryIndexLastSavedBytes = g_webLibraryIndexJson.length() + 2;
+    g_webLibraryIndexLastSaveError = String("Rebuild automatico devolvio menos archivos (") + String(newCount) + "/" + String(oldCountF42H) + "); se conserva indice previo";
+    logf("[LIB-IDX] rebuild shrink bloqueado new=%u old=%u allowShrink=0", (unsigned)newCount, (unsigned)oldCountF42H);
+    return true;
   }
 
   g_webLibraryIndexJson = tmp;
@@ -10256,7 +10922,16 @@ static bool webLibraryIndexRebuild(bool saveToFs = true) {
   g_webLibraryIndexLoaded = true;
   g_webLibraryIndexDirty = false;
   bool savedOk = true;
-  if (saveToFs) savedOk = webLibraryIndexSaveToFs();
+  if (saveToFs) {
+    savedOk = webLibraryIndexSaveToFsFromEntries(tmp, newCount);
+  } else {
+    g_webLibraryIndexLastSaveOk = false;
+    g_webLibraryIndexLastVerifyOk = false;
+    g_webLibraryIndexLastSavedBytes = 0;
+    g_webLibraryIndexLastVerifyCount = 0;
+    g_webLibraryIndexLastSaveMs = 0;
+    g_webLibraryIndexLastSaveError = "Modo seguro: índice reconstruido en RAM; SD no escrita sin commit=1";
+  }
   // F49Z47: despues de reconstruir el indice, sincronizar tambien
   // la cache transitoria usada por /api/atr/status?files=1. Asi ningun
   // refresco diferido puede volver a pintar una lista vieja o parcial.
@@ -10272,13 +10947,54 @@ static bool webLibraryIndexRebuild(bool saveToFs = true) {
 }
 
 // [F24] Eliminado helper no usado: webLibraryIndexInvalidate
-static bool webLibraryIndexEnsure(bool forceRefresh) {
+static bool webLibraryIndexRamUsable(bool repairCount = true) {
+  if (!g_webLibraryIndexLoaded || g_webLibraryIndexCount == 0) return false;
+  if (!g_webLibraryIndexJson.length()) {
+    logf("[LIB-IDX] RAM invalida: count=%u pero json vacio; se fuerza lectura desde SD", (unsigned)g_webLibraryIndexCount);
+    return false;
+  }
+
+  String e = g_webLibraryIndexJson;
+  webLibraryNormalizeEntriesJson(e);
+  if (!webLibraryEntriesLooksValid(e)) {
+    logf("[LIB-IDX] RAM invalida: entries no validas len=%u count=%u; se fuerza lectura desde SD", (unsigned)e.length(), (unsigned)g_webLibraryIndexCount);
+    return false;
+  }
+
+  uint32_t c = webLibraryCountObjects(e);
+  if (c == 0) {
+    logf("[LIB-IDX] RAM invalida: count=%u pero objects=0 len=%u; se fuerza lectura desde SD", (unsigned)g_webLibraryIndexCount, (unsigned)e.length());
+    return false;
+  }
+
+  // F42T: si el contador y el JSON real no coinciden, manda el JSON real.
+  // El contador solo es metadata; la fuente de verdad para listar es el array.
+  if (repairCount && c != g_webLibraryIndexCount) {
+    logf("[LIB-IDX] RAM count corregido: meta=%u real=%u", (unsigned)g_webLibraryIndexCount, (unsigned)c);
+    g_webLibraryIndexCount = c;
+  }
+
+  g_webLibraryIndexJson = e;
+  return true;
+}
+
+static bool webLibraryIndexEnsure(bool forceRefresh, bool allowShrink = false) {
   // F42G/F49Z46: solo refresh manual confirmado debe escanear la SD y actualizar
   // /CONFIG/library_index.json. Navegación normal, Cassette y /api/atr/status
   // solo leen RAM/FS/backup y nunca reconstruyen ni guardan [].
-  if (forceRefresh) return webLibraryIndexRebuild(true);
-  if (g_webLibraryIndexLoaded && g_webLibraryIndexCount > 0) { g_webLibraryIndexHits++; return true; }
-  if (webLibraryIndexLoadFromFs()) { g_webLibraryIndexHits++; return true; }
+  if (forceRefresh) return webLibraryIndexRebuild(false, allowShrink);
+
+  // F42T: no basta con g_webLibraryIndexCount > 0. Vimos casos reales donde
+  // indexCount quedaba en 147/148 pero el String global de entries quedaba vacio
+  // o inutilizable; eso producia total=0 y files=[]. Si RAM no es usable,
+  // recargamos desde /CONFIG/library_index.json o backup.
+  if (webLibraryIndexRamUsable(true)) { g_webLibraryIndexHits++; return true; }
+
+  g_webLibraryIndexLoaded = false;
+  g_webLibraryIndexJson = "";
+  g_webLibraryIndexCount = 0;
+
+  if (webLibraryIndexLoadFromFs() && webLibraryIndexRamUsable(true)) { g_webLibraryIndexHits++; return true; }
   return false;
 }
 
@@ -10449,6 +11165,137 @@ static void webLibraryAppendTypeCountsJson(String& json, const String& entries, 
   json += "}";
 }
 
+// F42X: paginacion directa desde /CONFIG/library_index.json.
+// Motivo: el archivo en SD puede estar correcto (36KB/148 objetos), pero cargarlo
+// completo a String para luego servir /api/library puede quedar en RAM vacia en
+// algunos ciclos. Esta ruta lee el JSON como stream, extrae objeto por objeto y
+// arma solo la pagina visible de files[]. No escribe SD ni reconstruye indice.
+static bool webLibraryStreamIndexFilePageAt(const char* path, int page, int pageSize, const String& qLower, const String& typeUpper,
+                                            String& pageEntries, uint32_t& totalMatches,
+                                            uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
+                                            uint32_t& fileBytesOut) {
+  pageEntries = "";
+  totalMatches = 0;
+  all = atr = xex = com = exe = bas = cas = sec = other = 0;
+  fileBytesOut = 0;
+
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  fileBytesOut = (uint32_t)f.size();
+
+  if (page < 0) page = 0;
+  if (pageSize <= 0) pageSize = 50;
+  if (pageSize > 250) pageSize = 250; // F42X: respuesta visible acotada para heap estable
+  uint32_t startWanted = (uint32_t)page * (uint32_t)pageSize;
+  uint32_t added = 0;
+
+  bool inString = false;
+  bool esc = false;
+  int level = 0;
+  bool capturing = false;
+  String obj;
+  obj.reserve(1536);
+
+  uint32_t bytesRead = 0;
+  while (true) {
+    int ri = f.read();
+    if (ri < 0) break;
+    char c = (char)ri;
+    bytesRead++;
+
+    if (!capturing) {
+      if (c == '{') {
+        capturing = true;
+        level = 1;
+        inString = false;
+        esc = false;
+        obj = "{";
+      }
+      continue;
+    }
+
+    obj += c;
+
+    if (inString) {
+      if (esc) { esc = false; }
+      else if (c == '\\') { esc = true; }
+      else if (c == '"') { inString = false; }
+    } else {
+      if (c == '"') inString = true;
+      else if (c == '{') level++;
+      else if (c == '}') level--;
+    }
+
+    if (capturing && level == 0) {
+      if (webLibraryObjectMatchesSearchOnly(obj, qLower)) {
+        all++;
+        String tt = webLibraryTypeFromObject(obj);
+        if (tt == "ATR") atr++;
+        else if (tt == "XEX") xex++;
+        else if (tt == "COM") com++;
+        else if (tt == "EXE") exe++;
+        else if (tt == "BAS") bas++;
+        else if (tt == "CAS") cas++;
+        else if (tt == "SEC") sec++;
+        else other++;
+      }
+
+      if (webLibraryObjectMatches(obj, qLower, typeUpper)) {
+        if (totalMatches >= startWanted && added < (uint32_t)pageSize) {
+          if (pageEntries.length()) pageEntries += ",";
+          pageEntries += obj;
+          added++;
+        }
+        totalMatches++;
+      }
+
+      obj = "";
+      capturing = false;
+      inString = false;
+      esc = false;
+      level = 0;
+      if ((bytesRead & 0x0FFF) == 0) yield();
+    }
+
+    if (obj.length() > 8192) {
+      // Defensa contra JSON dañado: no dejamos crecer un objeto indefinidamente.
+      logf("[LIB-IDX] direct page abort: objeto demasiado grande path=%s len=%u", path, (unsigned)obj.length());
+      f.close();
+      return false;
+    }
+  }
+  f.close();
+
+  bool ok = (all > 0 || totalMatches > 0 || qLower.length() || (typeUpper.length() && typeUpper != "ALL"));
+  logf("[LIB-IDX] direct page path=%s ok=%u bytes=%lu total=%lu all=%lu pageBytes=%u",
+       path, (unsigned)ok, (unsigned long)fileBytesOut, (unsigned long)totalMatches, (unsigned long)all, (unsigned)pageEntries.length());
+  return ok;
+}
+
+static bool webLibraryStreamIndexBestFilePage(int page, int pageSize, const String& qLower, const String& typeUpper,
+                                              String& pageEntries, uint32_t& totalMatches,
+                                              uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
+                                              String& sourceOut, uint32_t& fileBytesOut) {
+  const char* paths[] = { WEB_LIBRARY_INDEX_PATH, WEB_LIBRARY_INDEX_BAK_PATH, WEB_LIBRARY_INDEX_PREV_PATH };
+  const char* names[] = { "main", "bak", "prev" };
+
+  for (int i = 0; i < 3; i++) {
+    String pe;
+    uint32_t tm = 0, a = 0, at = 0, xx = 0, co = 0, ex = 0, ba = 0, ca = 0, se = 0, ot = 0, fb = 0;
+    if (webLibraryStreamIndexFilePageAt(paths[i], page, pageSize, qLower, typeUpper, pe, tm, a, at, xx, co, ex, ba, ca, se, ot, fb) && a > 0) {
+      pageEntries = pe;
+      totalMatches = tm;
+      all = a; atr = at; xex = xx; com = co; exe = ex; bas = ba; cas = ca; sec = se; other = ot;
+      sourceOut = names[i];
+      fileBytesOut = fb;
+      return true;
+    }
+  }
+  return false;
+}
+
+
 static void webLibraryAppendPagedEntries(String& out, const String& entries, int page, int pageSize, const String& qLower, const String& typeUpper, uint32_t& totalMatches) {
   if (page < 0) page = 0;
   if (pageSize <= 0) pageSize = 10000;
@@ -10539,15 +11386,18 @@ static void webAtrAppendFileListJsonCached(String &j, bool forceRefresh) {
   }
 
   uint32_t t0 = millis();
-  if (webLibraryIndexEnsure(forceRefresh)) {
+  // F43C: esta función es usada por status/compatibilidad. No puede disparar
+  // webLibraryIndexEnsure(), porque eso re-escanea desde Cassette/Web-ATR.
+  // Solo sirve cache ya existente; si no existe, devuelve lista vacía.
+  if (g_webLibraryIndexLoaded && g_webLibraryIndexJson.length() > 2) {
     g_webAtrFilesJsonCache = g_webLibraryIndexJson;
     g_webAtrFilesJsonBuildMs = g_webLibraryIndexBuildMs ? g_webLibraryIndexBuildMs : (millis() - t0);
     g_webAtrFilesJsonCount = g_webLibraryIndexCount;
   } else {
-    // F49Z46: sin refresh manual no se escanea SD como fallback.
     g_webAtrFilesJsonBuildMs = millis() - t0;
     g_webAtrFilesJsonCache = "";
     g_webAtrFilesJsonCount = 0;
+    logf("[LIB-IDX] F43C files cache pedido por status sin cache; no se escanea SD");
   }
   g_webAtrFilesJsonCacheMs = now;
   g_webAtrFilesJsonValid = true;
@@ -10558,17 +11408,17 @@ static void webAtrAppendFileListJsonCached(String &j, bool forceRefresh) {
 void handleAtrStatus() {
   bool fastStatus = server.hasArg("fast") && server.arg("fast") == "1";
   if (!fastStatus) webAtrRefreshPresence();
-  bool includeFiles = true;
+  // F43C: /api/atr/status, usado al montar/desmontar y al salir de Cassette,
+  // NO debe incluir ni reconstruir listados por defecto. La Biblioteca se lista
+  // desde /api/library y el escaneo lo hace únicamente el botón manual.
+  bool includeFiles = false;
   if (server.hasArg("files")) {
     String fv = server.arg("files");
     fv.toLowerCase();
-    includeFiles = !(fv == "0" || fv == "false" || fv == "no");
+    includeFiles = (fv == "1" || fv == "true" || fv == "yes");
   }
-  bool forceFilesRefresh = server.hasArg("refresh") && server.arg("refresh") == "1";
-  // F42G: /api/atr/status no puede reconstruir la biblioteca salvo refresh manual confirmado.
-  // Esto evita que salir de Cassette o entrar a Biblioteca dispare un escaneo accidental que deje todo en 0.
-  bool manualFilesRefresh = forceFilesRefresh && server.hasArg("manual") && server.arg("manual") == "1";
-  if (forceFilesRefresh && !manualFilesRefresh) forceFilesRefresh = false;
+  bool forceFilesRefresh = false;
+  bool manualFilesRefresh = false;
   String j = "{";
   j += "\"compiled\":true";
   j += ",\"mode\":\"flash-multi\"";
@@ -10663,7 +11513,7 @@ void handleAtrStatus() {
     if (paged && webLibraryIndexEnsure(forceFilesRefresh)) {
       int pageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 20);
       if (pageSize <= 0) pageSize = 20;
-      if (pageSize > 100) pageSize = 100;
+      if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
       int page = server.hasArg("page") ? server.arg("page").toInt() : 0;
       if (server.hasArg("offset")) page = server.arg("offset").toInt() / pageSize;
       String q = server.hasArg("q") ? server.arg("q") : String(""); q.toLowerCase();
@@ -10808,6 +11658,7 @@ void handleAtrDelete() {
   bool isCas = webCasLooksLikeName(name);
   String path = isCas ? webCasPathForName(name) : webAtrPathForName(name);
   if (webAtrFsReady() && SPIFFS.exists(path)) SPIFFS.remove(path);
+  webLibraryLiveScanCacheInvalidate("delete file");
   if (isCas) {
     String cacheBase = casAutoCacheBaseName(path);
     if (SPIFFS.exists(cacheBase + ".bin")) SPIFFS.remove(cacheBase + ".bin");
@@ -11183,7 +12034,8 @@ void handleCasAnalyze() {
   // F41: si se analiza desde Biblioteca, la cache queda persistida y se reconstruye
   // el índice para que /api/library exponga casAnalyzed/casProfile sin esperar otro refresco manual.
   bool indexRebuilt = false;
-  if (ok) indexRebuilt = webLibraryIndexRebuild(true);
+  // F42J: analizar CAS no reconstruye ni reemplaza el índice de Biblioteca.
+  // La tarjeta se actualiza en memoria del navegador; el índice persistente queda protegido.
   String casOverrideProfile;
   bool hasCasOverride = casProfileOverrideGet(name, casOverrideProfile);
   String casEffectiveProfile = hasCasOverride ? casOverrideProfile : String(g_casAutoAnalysis.profile);
@@ -11246,7 +12098,7 @@ void handleCasProfile() {
     String err, effective;
     bool ok = casProfileOverrideSet(name, profile, err, effective);
     bool indexRebuilt = false;
-    if (ok) indexRebuilt = webLibraryIndexRebuild(true);
+    // F42J: cambiar perfil CAS no reconstruye ni reemplaza el índice de Biblioteca.
 
     String autoProfile = "";
     CasAutoAnalysis cachedCas;
@@ -13979,12 +14831,11 @@ void handleApiLibraryIndexJson() {
 
   String entries;
   uint32_t count = 0;
-  bool ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_PATH, entries, &count);
-  if (!ok) ok = webLibraryLoadEntriesFromPath(WEB_LIBRARY_INDEX_BAK_PATH, entries, &count);
-  if (!ok) {
-    entries = webLibraryNormalizedEntriesCopy(g_webLibraryIndexJson);
-    count = webLibraryCountObjects(entries);
-    ok = entries.length() && webLibraryEntriesLooksValid(entries) && count > 0;
+  String source;
+  bool ok = webLibraryIndexLoadBestFromFs(entries, count, &source);
+  if (ok && source != "main" && source != "ram" && count > 0 && webLibraryEnsureConfigDir()) {
+    const char* src = (source == "bak") ? WEB_LIBRARY_INDEX_BAK_PATH : ((source == "prev") ? WEB_LIBRARY_INDEX_PREV_PATH : nullptr);
+    if (src) webLibraryIndexCopyFile(src, WEB_LIBRARY_INDEX_PATH);
   }
 
   String out;
@@ -14003,6 +14854,35 @@ void handleApiLibraryIndexJson() {
   server.send(200, "application/json", out);
 }
 
+
+// F42V: fallback de servicio. Si el archivo index fue verificado pero la carga
+// desde SD/RAM queda vacia, reconstruimos EN RAM usando el escaneo seguro y
+// servimos esa pagina sin tocar SD. Evita total=0/files=[] en navegacion normal.
+static bool webLibraryBuildLiveIndexForServe(const char* reason) {
+  if (!webAtrFsReady()) return false;
+  uint32_t t0 = millis();
+  String live;
+  live.reserve(49152);
+  webAtrAppendFileListJson(live);
+  webLibraryNormalizeEntriesJson(live);
+  uint32_t c = webLibraryCountObjects(live);
+  bool valid = webLibraryEntriesLooksValid(live);
+  if (c == 0 || !valid) {
+    logf("[LIB-IDX] live serve fallback fallo reason=%s count=%lu valid=%u len=%lu", reason ? reason : "", (unsigned long)c, valid ? 1 : 0, (unsigned long)live.length());
+    return false;
+  }
+  g_webLibraryIndexJson = live;
+  g_webLibraryIndexCount = c;
+  g_webLibraryIndexLoaded = true;
+  g_webLibraryIndexDirty = false;
+  g_webLibraryIndexBuildMs = millis() - t0;
+  g_webLibraryIndexLastSaveOk = false;
+  g_webLibraryIndexLastVerifyOk = false;
+  g_webLibraryIndexLastSaveError = String("Fallback live serve RAM; SD no escrita. reason=") + String(reason ? reason : "");
+  logf("[LIB-IDX] live serve fallback OK reason=%s count=%lu bytes=%lu ms=%lu", reason ? reason : "", (unsigned long)c, (unsigned long)g_webLibraryIndexJson.length(), (unsigned long)g_webLibraryIndexBuildMs);
+  return true;
+}
+
 void handleApiLibrary() {
   if (!webAtrFsReady()) {
     apiSendJsonError(500, "Almacenamiento no disponible");
@@ -14014,34 +14894,152 @@ void handleApiLibrary() {
     (server.hasArg("manual") && server.arg("manual") == "1") ||
     (server.hasArg("confirm") && server.arg("confirm") == "1")
   );
+  // F42J: refresh manual reconstruye RAM, pero NO escribe SD salvo commit=1.
+  // Esto evita que entrar/salir de Cassette o un refresh web deje library_index.json en [].
+  bool commitRefresh = manualRefresh && server.hasArg("commit") && server.arg("commit") == "1";
   bool forceRefresh = manualRefresh;
   if (refreshArg && !manualRefresh) {
     logf("[LIB-IDX] refresh ignorado por no venir con manual=1; usando indice existente");
   }
-  if (!webLibraryIndexEnsure(forceRefresh)) {
-    if (forceRefresh) {
-      apiSendJsonError(500, "No se pudo construir índice de Biblioteca");
-      return;
+
+  bool indexOk = false;
+  bool refreshFailed = false;
+  String refreshError = "";
+
+  // F43B: refresh=1&manual=1 sin commit ya no pasa por el rebuild antiguo.
+  // Solo invalida cache y lista por live-scan paginado, evitando count parcial
+  // y RAM/index JSON vacio. Para escribir SD se exige commit=1.
+  if (manualRefresh && !commitRefresh) {
+    webLibraryLiveScanCacheInvalidate("manual refresh live only");
+    manualRefresh = false;
+    forceRefresh = false;
+  }
+
+  if (manualRefresh) {
+    webLibraryLiveScanCacheInvalidate(commitRefresh ? "manual commit" : "manual refresh");
+    bool prevConsoleScan = g_webLibraryConsoleScan;
+    g_webLibraryConsoleScan = webLibraryConsoleScanArgEnabled();
+    indexOk = webLibraryIndexRebuild(commitRefresh, true);
+    g_webLibraryConsoleScan = prevConsoleScan;
+    if (!indexOk) {
+      // F42M: el refresco manual no debe tumbar la web ni devolver 500.
+      // Si el re-escaneo SD falla o devuelve 0, se conserva/recupera el mejor
+      // índice disponible desde RAM, library_index.json, .bak o .prev.
+      refreshFailed = true;
+      refreshError = g_webLibraryIndexLastSaveError;
+      if (!refreshError.length()) refreshError = "Rebuild manual falló; se conserva índice existente/backup";
+      logf("[LIB-IDX] refresh manual fallo; fallback a indice existente: %s", refreshError.c_str());
+      indexOk = webLibraryIndexEnsure(false, false);
     }
-    // F49Z46: carga normal sin indice existente. No escanear SD; indicar que
-    // se requiere pulsar Refrescar biblioteca para crear/actualizar el JSON.
+  } else {
+    // F42Y: navegación normal NO debe tocar el índice persistente ni RAM.
+    // El botón Biblioteca debe ir directo al escaneo seguro paginado más abajo.
+    // Esto evita el ciclo observado: load len=0 -> RAM inválida -> fallback -> abort().
+    indexOk = true;
+  }
+
+  if (!indexOk) {
+    // F42V: si cargar desde SD falla pero la SD esta lista, intentamos servir
+    // desde escaneo seguro en RAM, sin guardar en SD.
+    if (!commitRefresh && webLibraryBuildLiveIndexForServe("indexOk=false")) {
+      indexOk = true;
+    }
+  }
+
+  if (!indexOk) {
+    // F42M: nunca responder 500 en /api/library por falta de índice. La UI debe
+    // poder renderizar estado vacío y permitir recuperación manual sin caer.
     String json = "{\"ok\":true";
     json += ",\"source\":\"library_index\"";
     json += ",\"indexMissing\":true";
     json += ",\"needsRefresh\":true";
+    json += ",\"refreshFailed\":" + String(refreshFailed ? "true" : "false");
+    if (refreshError.length()) json += ",\"refreshError\":\"" + jsonEscape(refreshError) + "\"";
     json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
-    json += ",\"page\":0,\"pageSize\":20,\"total\":0,\"typeCounts\":{\"ALL\":0,\"ATR\":0,\"XEX\":0,\"COM\":0,\"EXE\":0,\"BAS\":0,\"CAS\":0,\"SEC\":0,\"OTHER\":0},\"files\":[]}";
-    server.sendHeader("Cache-Control", "no-store");
+    json += ",\"page\":0,\"pageSize\":50,\"total\":0,\"typeCounts\":{\"ALL\":0,\"ATR\":0,\"XEX\":0,\"COM\":0,\"EXE\":0,\"BAS\":0,\"CAS\":0,\"SEC\":0,\"OTHER\":0},\"files\":[]}";
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.send(200, "application/json", json);
+    return;
+  }
+
+  // F42N: commit=1 debe ser una operación de guardado/confirmación, no una
+  // descarga del listado completo. En F42M esta misma ruta seguía cayendo al
+  // flujo streaming de files[] y en algunos ESP32/WebServer se cortaba con
+  // ERR_INCOMPLETE_CHUNKED_ENCODING. Respondemos un JSON pequeño y después la
+  // web/app puede pedir /api/library?refresh=0 para listar paginado.
+  if (commitRefresh) {
+    // F43D: commit=1 sí escanea y guarda; además devuelve la página visible.
+    // En F43C la respuesta era compacta con files:[], lo que hacía parecer que
+    // no había escaneo. Ahora el commit deja cache RAM poblado y responde page/files.
+    int cPageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 50);
+    if (cPageSize <= 0) cPageSize = 50;
+    if (cPageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) cPageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+    int cPage = server.hasArg("page") ? server.arg("page").toInt() : 0;
+    if (server.hasArg("offset")) cPage = server.arg("offset").toInt() / cPageSize;
+    if (cPage < 0) cPage = 0;
+    String cQ = server.hasArg("q") ? server.arg("q") : String(""); cQ.toLowerCase();
+    String cType = server.hasArg("type") ? server.arg("type") : String(""); cType.toUpperCase();
+
+    // Poblar cache vivo desde el mismo botón/acción manual. Esta es la única
+    // ruta, junto a refresh=1&manual=1 sin commit, que puede escanear la SD.
+    std::vector<WebLibraryScanEntry> commitEntries;
+    bool commitCacheHit = false;
+    uint32_t commitCacheAge = 0;
+    uint32_t commitCacheBuild = 0;
+    bool commitCacheOk = webLibraryLiveScanCacheGet(commitEntries, true, commitCacheHit, commitCacheAge, commitCacheBuild);
+
+    String pageEntries;
+    uint32_t totalMatches = 0;
+    uint32_t lcAll = 0, lcAtr = 0, lcXex = 0, lcCom = 0, lcExe = 0, lcBas = 0, lcCas = 0, lcSec = 0, lcOther = 0;
+    uint32_t liveMs = 0;
+    bool pageOk = commitCacheOk && webLibraryBuildLiveVisiblePage(cPage, cPageSize, cQ, cType, pageEntries, totalMatches,
+                                                                  lcAll, lcAtr, lcXex, lcCom, lcExe, lcBas, lcCas, lcSec, lcOther,
+                                                                  liveMs);
+
+    String json;
+    json.reserve(4096 + pageEntries.length());
+    json = "{\"ok\":true";
+    json += ",\"source\":\"library_commit_live_page\"";
+    json += ",\"refreshed\":true";
+    json += ",\"indexCommit\":true";
+    json += ",\"commitOnly\":false";
+    json += ",\"commitReturnedFiles\":" + String(pageOk ? "true" : "false");
+    json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
+    json += ",\"indexCount\":" + String(g_webLibraryIndexCount);
+    json += ",\"indexBuildMs\":" + String(g_webLibraryIndexBuildMs);
+    json += ",\"indexLoadMs\":" + String(g_webLibraryIndexLoadMs);
+    webLibraryAppendSaveStatusJson(json);
+    json += ",\"page\":" + String(cPage);
+    json += ",\"pageSize\":" + String(pageOk ? cPageSize : 0);
+    json += ",\"total\":" + String(pageOk ? totalMatches : g_webLibraryIndexCount);
+    json += ",\"typeCounts\":{";
+    json += "\"ALL\":" + String(pageOk ? lcAll : g_webLibraryIndexCount);
+    json += ",\"ATR\":" + String(pageOk ? lcAtr : 0);
+    json += ",\"XEX\":" + String(pageOk ? lcXex : 0);
+    json += ",\"COM\":" + String(pageOk ? lcCom : 0);
+    json += ",\"EXE\":" + String(pageOk ? lcExe : 0);
+    json += ",\"BAS\":" + String(pageOk ? lcBas : 0);
+    json += ",\"CAS\":" + String(pageOk ? lcCas : 0);
+    json += ",\"SEC\":" + String(pageOk ? lcSec : 0);
+    json += ",\"OTHER\":" + String(pageOk ? lcOther : 0);
+    json += "}";
+    json += ",\"files\":[";
+    if (pageOk) json += pageEntries;
+    json += "]}";
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
     server.send(200, "application/json", json);
     return;
   }
 
   int pageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 0);
-  // F42E: /api/library vuelve a ser compatible con bibliotecas grandes.
-  // Si no se indica pageSize, se devuelve hasta 10000 entradas. La web/app
-  // puede pedir page/pageSize para paginar, pero no existe límite duro de 100.
-  bool paged = true;
-  if (pageSize <= 0) pageSize = 10000;
+  // F42K: library_index.json es un ARRAY válido con todos los archivos.
+  // /api/library NO debe intentar devolver siempre los 148+ objetos en una sola respuesta
+  // porque eso puede cortar chunked encoding en ESP32 y dejar la UI con total pero sin lista.
+  // Por defecto se responde una página segura de 50. El total sigue informando todos los archivos.
+  // Quien necesite todo explícitamente puede pedir pageSize=10000.
+  if (pageSize <= 0) pageSize = 50;
   if (pageSize > 10000) pageSize = 10000;
 
   int page = server.hasArg("page") ? server.arg("page").toInt() : 0;
@@ -14050,15 +15048,172 @@ void handleApiLibrary() {
   String q = server.hasArg("q") ? server.arg("q") : String(""); q.toLowerCase();
   String type = server.hasArg("type") ? server.arg("type") : String(""); type.toUpperCase();
 
-  // F42F: saneamos RAM antes de contar/servir y evitamos construir pageEntries completo.
+  // F42Y: ruta principal para navegacion normal.
+  // Al presionar Biblioteca NO intentamos cargar library_index.json ni g_webLibraryIndexJson,
+  // porque en esta placa se vio load len=0 y abort() en la ruta de fallback.
+  // Se escanea la SD de forma segura y se devuelve solo la pagina visible.
+  if (!manualRefresh) {
+    if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+    String liveEntries;
+    uint32_t liveTotal = 0;
+    uint32_t lcAll = 0, lcAtr = 0, lcXex = 0, lcCom = 0, lcExe = 0, lcBas = 0, lcCas = 0, lcSec = 0, lcOther = 0;
+    uint32_t liveMs = 0;
+    if (webLibraryBuildLiveVisiblePage(page, pageSize, q, type, liveEntries, liveTotal,
+                                       lcAll, lcAtr, lcXex, lcCom, lcExe, lcBas, lcCas, lcSec, lcOther, liveMs)) {
+      String json;
+      json.reserve(4096 + liveEntries.length());
+      json = "{\"ok\":true";
+      json += ",\"source\":\"library_live_scan_page\"";
+      json += ",\"refreshed\":false";
+      json += ",\"refreshFailed\":false";
+      json += ",\"indexCommit\":false";
+      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
+      json += ",\"indexCount\":" + String(lcAll);
+      json += ",\"indexBuildMs\":" + String(liveMs);
+      json += ",\"indexLoadMs\":0";
+      webLibraryAppendSaveStatusJson(json);
+      json += ",\"page\":" + String(page);
+      json += ",\"pageSize\":" + String(pageSize);
+      json += ",\"total\":" + String(liveTotal);
+      json += ",\"typeCounts\":{";
+      json += "\"ALL\":" + String(lcAll);
+      json += ",\"ATR\":" + String(lcAtr);
+      json += ",\"XEX\":" + String(lcXex);
+      json += ",\"COM\":" + String(lcCom);
+      json += ",\"EXE\":" + String(lcExe);
+      json += ",\"BAS\":" + String(lcBas);
+      json += ",\"CAS\":" + String(lcCas);
+      json += ",\"SEC\":" + String(lcSec);
+      json += ",\"OTHER\":" + String(lcOther);
+      json += "}";
+      json += ",\"files\":[";
+      json += liveEntries;
+      json += "]}";
+      server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "0");
+      server.send(200, "application/json", json);
+      return;
+    }
+    // F43C: si no hay cache de Biblioteca, no escaneamos automáticamente.
+    // El usuario debe presionar el botón Refrescar Biblioteca.
+    String json = "{\"ok\":true";
+    json += ",\"source\":\"library_cache_only\"";
+    json += ",\"refreshed\":false";
+    json += ",\"autoScanDisabled\":true";
+    json += ",\"needsManualRefresh\":true";
+    json += ",\"message\":\"Presiona Refrescar biblioteca para escanear la SD\"";
+    json += ",\"page\":" + String(page);
+    json += ",\"pageSize\":" + String(pageSize);
+    json += ",\"total\":0";
+    json += ",\"typeCounts\":{\"ALL\":0,\"ATR\":0,\"XEX\":0,\"COM\":0,\"EXE\":0,\"BAS\":0,\"CAS\":0,\"SEC\":0,\"OTHER\":0}";
+    json += ",\"files\":[]}";
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.send(200, "application/json", json);
+    return;
+  }
+
+  // F42X: para navegacion normal servimos directo desde /CONFIG/library_index.json
+  // sin cargar el array completo a RAM. El archivo que queda en SD es la fuente
+  // de verdad; si existe y tiene objetos, generamos total/typeCounts/files[] por streaming.
+  if (!manualRefresh) {
+    if (pageSize > 250) pageSize = 250;
+    String directEntries;
+    directEntries.reserve(pageSize <= 50 ? 24576 : 32768);
+    uint32_t directTotal = 0;
+    uint32_t dcAll = 0, dcAtr = 0, dcXex = 0, dcCom = 0, dcExe = 0, dcBas = 0, dcCas = 0, dcSec = 0, dcOther = 0;
+    String directSource;
+    uint32_t directBytes = 0;
+    if (webLibraryStreamIndexBestFilePage(page, pageSize, q, type, directEntries, directTotal,
+                                          dcAll, dcAtr, dcXex, dcCom, dcExe, dcBas, dcCas, dcSec, dcOther,
+                                          directSource, directBytes)) {
+      g_webLibraryIndexCount = dcAll;
+      g_webLibraryIndexLoaded = true;
+      g_webLibraryIndexDirty = false;
+      String json;
+      json.reserve(4096 + directEntries.length());
+      json = "{\"ok\":true";
+      json += ",\"source\":\"library_index_file_direct\"";
+      json += ",\"indexSource\":\"" + jsonEscape(directSource) + "\"";
+      json += ",\"refreshed\":false";
+      json += ",\"refreshFailed\":false";
+      json += ",\"indexCommit\":false";
+      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
+      json += ",\"indexCount\":" + String(dcAll);
+      json += ",\"indexFileBytes\":" + String(directBytes);
+      json += ",\"indexBuildMs\":" + String(g_webLibraryIndexBuildMs);
+      json += ",\"indexLoadMs\":" + String(g_webLibraryIndexLoadMs);
+      webLibraryAppendSaveStatusJson(json);
+      json += ",\"page\":" + String(page);
+      json += ",\"pageSize\":" + String(pageSize);
+      json += ",\"total\":" + String(directTotal);
+      json += ",\"typeCounts\":{";
+      json += "\"ALL\":" + String(dcAll);
+      json += ",\"ATR\":" + String(dcAtr);
+      json += ",\"XEX\":" + String(dcXex);
+      json += ",\"COM\":" + String(dcCom);
+      json += ",\"EXE\":" + String(dcExe);
+      json += ",\"BAS\":" + String(dcBas);
+      json += ",\"CAS\":" + String(dcCas);
+      json += ",\"SEC\":" + String(dcSec);
+      json += ",\"OTHER\":" + String(dcOther);
+      json += "}";
+      json += ",\"files\":[";
+      json += directEntries;
+      json += "]}";
+      server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "0");
+      server.send(200, "application/json", json);
+      return;
+    }
+    logf("[LIB-IDX] direct file page fallo; se usa fallback RAM/SD");
+  }
+
+  // F42F/F42T: saneamos RAM antes de contar/servir y evitamos construir pageEntries completo.
+  // Si la metadata dice que hay archivos pero el String global no sirve, recargamos
+  // desde SD/backup antes de responder para evitar total=0 files=[].
+  if (!webLibraryIndexRamUsable(true)) {
+    logf("[LIB-IDX] serve detecto RAM no usable; recargando indice desde SD");
+    webLibraryIndexLoadFromFs();
+    webLibraryIndexRamUsable(true);
+  }
+  if (!webLibraryIndexRamUsable(true)) {
+    webLibraryBuildLiveIndexForServe("serve RAM/SD unusable");
+  }
   webLibraryNormalizeEntriesJson(g_webLibraryIndexJson);
-  uint32_t totalMatches = webLibraryCountMatchingEntries(g_webLibraryIndexJson, q, type);
+  uint32_t realObjectCount = webLibraryCountObjects(g_webLibraryIndexJson);
+  if (realObjectCount != g_webLibraryIndexCount && realObjectCount > 0) {
+    logf("[LIB-IDX] serve count corregido: meta=%u real=%u", (unsigned)g_webLibraryIndexCount, (unsigned)realObjectCount);
+    g_webLibraryIndexCount = realObjectCount;
+  }
+  // F42W: volver a construir files[] para la pagina visible en un String pequeño.
+  // F42L/V usaban respuesta chunked; en algunos navegadores/ESP32 se veia total,
+  // pero files quedaba vacio o la respuesta se cortaba. Para pageSize normal (50)
+  // armamos un JSON completo y lo enviamos con server.send().
+  // El listado completo sigue estando paginado para no saturar heap.
+  uint32_t totalMatches = 0;
+  String pageEntries;
+  pageEntries.reserve(pageSize <= 50 ? 24576 : 32768);
+  webLibraryAppendPagedEntries(pageEntries, g_webLibraryIndexJson, page, pageSize, q, type, totalMatches);
+
+  if (totalMatches == 0 && realObjectCount > 0 && q.length() == 0 && (type.length() == 0 || type == "ALL")) {
+    logf("[LIB-IDX] serve total=0 con realObjectCount=%u; intentando live fallback", (unsigned)realObjectCount);
+    if (webLibraryBuildLiveIndexForServe("serve total=0 despite realObjectCount")) {
+      totalMatches = 0;
+      pageEntries = "";
+      webLibraryAppendPagedEntries(pageEntries, g_webLibraryIndexJson, page, pageSize, q, type, totalMatches);
+    }
+  }
 
   String json;
-  json.reserve(1024);
+  json.reserve(24576 + pageEntries.length());
   json = "{\"ok\":true";
   json += ",\"source\":\"library_index\"";
   json += ",\"refreshed\":" + String(forceRefresh ? "true" : "false");
+  json += ",\"refreshFailed\":" + String(refreshFailed ? "true" : "false");
+  if (refreshError.length()) json += ",\"refreshError\":\"" + jsonEscape(refreshError) + "\"";
+  json += ",\"indexCommit\":" + String(commitRefresh ? "true" : "false");
   json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
   json += ",\"indexCount\":" + String(g_webLibraryIndexCount);
   json += ",\"indexBuildMs\":" + String(g_webLibraryIndexBuildMs);
@@ -14069,20 +15224,211 @@ void handleApiLibrary() {
   json += ",\"total\":" + String(totalMatches);
   webLibraryAppendTypeCountsJson(json, g_webLibraryIndexJson, q);
   json += ",\"files\":[";
+  json += pageEntries;
+  json += "]}";
 
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
-  server.sendContent(json);
+  // F42W: respuesta normal con JSON completo de la pagina visible.
+  // No se usa Content-Length manual ni streaming chunked para evitar:
+  // - total visible pero files vacio
+  // - ERR_INCOMPLETE_CHUNKED_ENCODING
+  // - ERR_CONTENT_LENGTH_MISMATCH por cierre de chunk incompleto.
+  server.send(200, "application/json", json);
 
-  // F42F: streaming seguro de objetos, no de texto prearmado con comas.
-  webLibraryStreamPagedEntries(g_webLibraryIndexJson, page, pageSize, q, type);
-
-  server.sendContent("]}");
-  server.client().flush();
 }
+
+// F42R: escaneo de consola seguro y sin structs custom en firmas.
+// Motivo: Arduino IDE genera prototipos antes de algunas declaraciones del .ino;
+// usando solo contadores globales evitamos errores tipo "WebLibraryConsoleScanStats no declarado".
+static uint32_t g_libConsoleScanAll = 0;
+static uint32_t g_libConsoleScanAtr = 0;
+static uint32_t g_libConsoleScanXex = 0;
+static uint32_t g_libConsoleScanCas = 0;
+static uint32_t g_libConsoleScanOther = 0;
+static uint32_t g_libConsoleScanDirs = 0;
+static uint32_t g_libConsoleScanSkippedDirs = 0;
+
+static void webLibraryConsoleScanResetCounters() {
+  g_libConsoleScanAll = 0;
+  g_libConsoleScanAtr = 0;
+  g_libConsoleScanXex = 0;
+  g_libConsoleScanCas = 0;
+  g_libConsoleScanOther = 0;
+  g_libConsoleScanDirs = 0;
+  g_libConsoleScanSkippedDirs = 0;
+}
+
+static void webLibraryConsoleScanCountType(const String& type) {
+  g_libConsoleScanAll++;
+  if (type == "ATR") g_libConsoleScanAtr++;
+  else if (type == "XEX") g_libConsoleScanXex++;
+  else if (type == "CAS") g_libConsoleScanCas++;
+  else g_libConsoleScanOther++;
+}
+
+static void webLibraryConsoleScanDir(const char* dirPath, uint8_t depth) {
+  if (!webAtrFsReady()) {
+    logf("[LIB-SD] SKIP dir=%s ready=0", dirPath);
+    return;
+  }
+  if (depth > 4) {
+    logf("[LIB-SD] SKIP dir=%s depth=%u maxDepth", dirPath, (unsigned)depth);
+    return;
+  }
+
+  String baseDir(dirPath ? dirPath : "/");
+  baseDir.replace("\\", "/");
+  if (!baseDir.length()) baseDir = "/";
+  if (!baseDir.startsWith("/")) baseDir = String("/") + baseDir;
+  if (webAtrLibraryScanSkipDir(baseDir)) {
+    g_libConsoleScanSkippedDirs++;
+    logf("[LIB-SD] SKIP dir=%s", baseDir.c_str());
+    return;
+  }
+
+  logf("[LIB-SD] SCAN depth=%u dir=%s", (unsigned)depth, baseDir.c_str());
+  File root = SPIFFS.open(baseDir, "r");
+  if (!root) {
+    logf("[LIB-SD] OPEN FAIL dir=%s", baseDir.c_str());
+    return;
+  }
+  if (!root.isDirectory()) {
+    logf("[LIB-SD] NOT DIR path=%s", baseDir.c_str());
+    root.close();
+    return;
+  }
+
+  File f = root.openNextFile();
+  while (f) {
+    String path = f.name();
+    path.replace("\\", "/");
+    bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
+    f.close();
+
+    if (path.length() && !path.startsWith("/")) {
+      String prefix = baseDir;
+      if (!prefix.endsWith("/")) prefix += "/";
+      path = prefix + path;
+    }
+
+    if (isDir) {
+      if (webAtrLibraryScanSkipDir(path)) {
+        g_libConsoleScanSkippedDirs++;
+        logf("[LIB-SD] SKIP dir=%s", path.c_str());
+      } else {
+        g_libConsoleScanDirs++;
+        webLibraryConsoleScanDir(path.c_str(), depth + 1);
+      }
+    } else {
+      int slash = path.lastIndexOf('/');
+      String rawName = (slash >= 0) ? path.substring(slash + 1) : path;
+      String clean = webAtrSanitizeFileName(rawName);
+      if (webAtrIsMountableVisibleName(rawName) && clean.length()) {
+        String type = webAtrStoredTypeForName(clean);
+        webLibraryConsoleScanCountType(type);
+        logf("[LIB-SD] FOUND #%lu type=%s name=%s path=%s",
+             (unsigned long)g_libConsoleScanAll, type.c_str(), clean.c_str(), path.c_str());
+        if ((g_libConsoleScanAll % 20) == 0) delay(1);
+      }
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+}
+
+static void webLibraryConsoleScanRootShallow() {
+  logf("[LIB-SD] SCAN shallow dir=/");
+  File root = SPIFFS.open("/", "r");
+  if (!root) { logf("[LIB-SD] OPEN FAIL shallow dir=/"); return; }
+  if (!root.isDirectory()) { logf("[LIB-SD] NOT DIR shallow path=/"); root.close(); return; }
+  File f = root.openNextFile();
+  while (f) {
+    String path = f.name();
+    path.replace("\\", "/");
+    bool isDir = f.isDirectory();
+    uint32_t fSize = isDir ? 0 : (uint32_t)f.size();
+    f.close();
+    if (!isDir) {
+      if (path.length() && !path.startsWith("/")) path = String("/") + path;
+      int slash = path.lastIndexOf('/');
+      String rawName = (slash >= 0) ? path.substring(slash + 1) : path;
+      String clean = webAtrSanitizeFileName(rawName);
+      if (webAtrIsMountableVisibleName(rawName) && clean.length()) {
+        String type = webAtrStoredTypeForName(clean);
+        webLibraryConsoleScanCountType(type);
+        logf("[LIB-SD] FOUND #%lu type=%s name=%s path=%s",
+             (unsigned long)g_libConsoleScanAll, type.c_str(), clean.c_str(), path.c_str());
+      }
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+}
+
+static void webLibraryConsoleScanKnownDirs() {
+  webLibraryConsoleScanResetCounters();
+  logf("[LIB-SD] ===== INICIO ESCANEO SD Biblioteca SEGURO =====");
+  logf("[LIB-SD] ready=%u backend=%s heap=%lu maxAlloc=%lu",
+       (unsigned)webAtrFsReady(), WEB_STORAGE_NAME,
+       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+#if WEB_STORAGE_USE_SD
+  webLibraryConsoleScanDir("/ATR", 0);
+  webLibraryConsoleScanDir("/CAS", 0);
+  webLibraryConsoleScanDir("/LIBRARY", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/ATR", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/CAS", 0);
+  webLibraryConsoleScanRootShallow();
+#endif
+  logf("[LIB-SD] ===== FIN ESCANEO SD Biblioteca: total=%lu ATR=%lu XEX=%lu CAS=%lu OTHER=%lu dirs=%lu skipped=%lu heap=%lu =====",
+       (unsigned long)g_libConsoleScanAll, (unsigned long)g_libConsoleScanAtr, (unsigned long)g_libConsoleScanXex,
+       (unsigned long)g_libConsoleScanCas, (unsigned long)g_libConsoleScanOther, (unsigned long)g_libConsoleScanDirs,
+       (unsigned long)g_libConsoleScanSkippedDirs, (unsigned long)ESP.getFreeHeap());
+}
+
+void handleApiLibraryScanConsole() {
+  if (!webAtrFsReady()) {
+    apiSendJsonError(500, "Almacenamiento no disponible");
+    return;
+  }
+
+  bool save = server.hasArg("commit") && server.arg("commit") == "1";
+  webLibraryConsoleScanKnownDirs();
+  bool saveOk = false;
+  if (save) {
+    // F42S: permite validar por consola y luego reconstruir/guardar con el mismo
+    // camino seguro de Biblioteca. La respuesta sigue siendo pequeña.
+    bool prevConsoleScan = g_webLibraryConsoleScan;
+    g_webLibraryConsoleScan = false;
+    saveOk = webLibraryIndexRebuild(true, true);
+    g_webLibraryConsoleScan = prevConsoleScan;
+    logf("[LIB-SD] scan_console commit=1 rebuild/save ok=%u count=%lu err=%s",
+         (unsigned)saveOk, (unsigned long)g_webLibraryIndexCount, g_webLibraryIndexLastSaveError.c_str());
+  }
+
+  String json = "{\"ok\":true";
+  json += ",\"action\":\"scan_console\"";
+  json += ",\"build\":\"" + jsonEscape(String(MASTER_BUILD)) + "\"";
+  json += ",\"saved\":" + String((save && saveOk) ? "true" : "false");
+  json += ",\"commitIgnored\":false";
+  json += ",\"scanPrinted\":" + String(g_libConsoleScanAll);
+  json += ",\"atr\":" + String(g_libConsoleScanAtr);
+  json += ",\"xex\":" + String(g_libConsoleScanXex);
+  json += ",\"cas\":" + String(g_libConsoleScanCas);
+  json += ",\"other\":" + String(g_libConsoleScanOther);
+  json += ",\"skippedDirs\":" + String(g_libConsoleScanSkippedDirs);
+  json += ",\"indexCount\":" + String(g_webLibraryIndexCount);
+  json += ",\"indexSaved\":" + String(g_webLibraryIndexLastSaveOk ? "true" : "false");
+  json += ",\"indexVerifyOk\":" + String(g_webLibraryIndexLastVerifyOk ? "true" : "false");
+  json += ",\"indexVerifyCount\":" + String(g_webLibraryIndexLastVerifyCount);
+  json += ",\"indexSaveError\":\"" + jsonEscape(g_webLibraryIndexLastSaveError) + "\"";
+  json += ",\"message\":\"Revisa el Monitor Serie: lineas [LIB-SD] con carpetas y archivos encontrados\"}";
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send(200, "application/json", json);
+}
+
 static bool apiMountWebAtrUnit(int unit, const String& requestedFile, String& err) {
   if (!apiValidateDriveUnit(unit)) { err = "Unidad inválida"; return false; }
   String name = webAtrSanitizeFileName(requestedFile);
@@ -15339,6 +16685,13 @@ static void tnfsStreamJsonLine(const String& line) {
   server.sendContent("\n");
 }
 
+static void tnfsStreamFinish() {
+  // Cierra correctamente la respuesta chunked/NDJSON.
+  // Sin esto, algunos clientes terminan sin recibir el evento final y reportan
+  // TNFS_STREAM_WITHOUT_FINAL aunque el archivo XEX/COM/EXE/BAS ya se haya guardado.
+  server.sendContent("");
+}
+
 static void tnfsStreamEvent(const String& phase, const String& message, uint32_t bytes, uint32_t elapsedMs, bool ok = true) {
   String j = "{";
   j += "\"type\":\"progress\"";
@@ -15533,6 +16886,7 @@ static void handleApiTnfsFetchMountStream() {
     if (hint.length()) j += ",\"hint\":\"" + jsonEscape(hint) + "\"";
     j += ",\"elapsedMs\":" + String((unsigned long)(millis() - t0)) + "}";
     tnfsStreamJsonLine(j);
+    tnfsStreamFinish();
   };
 
   TnfsParsedUrl u;
@@ -15593,6 +16947,7 @@ static void handleApiTnfsFetchMountStream() {
     webAtrInvalidateFilesCache();
     logf("[TNFS-CAS] %s %s -> %s C: bytes=%lu elapsed=%lu ms", skipped ? "SKIP" : "DOWNLOAD", remotePath.c_str(), localPath.c_str(), (unsigned long)bytes, (unsigned long)(millis() - t0));
     tnfsStreamJsonLine(tnfsAsDoneJson(finalJson));
+    tnfsStreamFinish();
     return;
   }
 
@@ -15601,6 +16956,7 @@ static void handleApiTnfsFetchMountStream() {
     logf("[TNFS-RAW] %s %s -> %s bytes=%lu elapsed=%lu ms", skipped ? "SKIP" : "DOWNLOAD", remotePath.c_str(), localPath.c_str(), (unsigned long)bytes, (unsigned long)(millis() - t0));
     String finalJson = tnfsRawDownloadDoneJson(remotePath, localName, localPath, skipped, bytes, (uint32_t)(millis() - t0));
     tnfsStreamJsonLine(tnfsAsDoneJson(finalJson));
+    tnfsStreamFinish();
     return;
   }
 
@@ -15618,6 +16974,7 @@ static void handleApiTnfsFetchMountStream() {
 
   String finalJson = webAtrLightStatusJsonWithTnfs(skipped ? "tnfs_skip_mount" : "tnfs_download_mount", remotePath, localName, localPath, unit, skipped, bytes, (uint32_t)(millis() - t0));
   tnfsStreamJsonLine(tnfsAsDoneJson(finalJson));
+  tnfsStreamFinish();
 }
 
 static void handleApiTnfsFetchMount() {
@@ -16402,6 +17759,7 @@ void setup() {
   // Android REST API V14 SLIM
   server.on("/api/drives", HTTP_GET, handleApiDrives);
   server.on("/api/library", HTTP_GET, handleApiLibrary);
+  server.on("/api/library/scan_console", HTTP_GET, handleApiLibraryScanConsole);
   server.on("/api/library_index_json", HTTP_GET, handleApiLibraryIndexJson);
   server.on("/api/drives/add", HTTP_POST, handleApiDriveAdd);
   server.onNotFound(handleApiDynamicRouter);

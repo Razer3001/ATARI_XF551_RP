@@ -3467,7 +3467,24 @@ const maybeFinal = tnfsHandleProgressEvent(evt, name, unit);
 if (maybeFinal) finalEvent = maybeFinal;
 } catch(e) {}
 }
-return finalEvent || { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL" };
+if (finalEvent) return finalEvent;
+// F43G: algunos servidores/navegadores cortan el NDJSON justo antes del evento final.
+// Confirmamos con la ruta JSON normal; si el archivo ya quedó guardado, esta llamada hace SKIP y responde OK.
+try {
+const qs2 = new URLSearchParams(qs);
+qs2.delete("stream");
+tnfsShowProgress("Confirmando descarga TNFS...", 96, true);
+const r2 = await fetch("/api/tnfs/fetch_mount?" + qs2.toString(), { cache:"no-store" });
+const j2 = await r2.json();
+if (j2 && j2.ok) {
+tnfsHandleProgressEvent({ type:"done", phase:"done", ok:1, bytes:Number(j2.bytes||0), message:"TNFS listo." }, name, unit);
+return j2;
+}
+if (j2) return j2;
+} catch(e) {
+return { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL", detail:String((e && e.message) || e) };
+}
+return { ok:0, error:"TNFS_STREAM_WITHOUT_FINAL" };
 }
 async function tnfsDownloadMount(name, unit, sourceButton) {
 name = String(name || "").trim();
@@ -6843,4 +6860,4 @@ const boot=()=>{apply(kind(location.pathname)||'home',true);setTimeout(()=>apply
 
 
 
-(function(){try{console.info('F31_LIBRARY_LEGACY_NEUTRALIZED_FIX activo · no debe aparecer Biblioteca F49Z47_TIMEOUT.');}catch(e){}})();
+(function(){try{console.info('F42L_LIBRARY_HTTP_NO_CONTENT_LENGTH_FIX activo · no debe aparecer Biblioteca F49Z47_TIMEOUT.');}catch(e){}})();
