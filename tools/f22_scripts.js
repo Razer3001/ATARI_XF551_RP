@@ -1638,7 +1638,7 @@ let mask = 0;
 for (let i=1;i<=UI_MAX_UNITS;i++) if ($(`${prefix}${i}`)?.checked) mask |= (1 << (i-1));
 return mask;
 }
-const ATR_IMAGE_LOAD_MAX = 1;
+const ATR_IMAGE_LOAD_MAX = 2; // F43F: dos imágenes simultáneas como máximo
 const ATR_THUMB_MISS_TTL_MS_F49Z41 = 30 * 60 * 1000;
 let atrImageLoadActive = 0;
 const atrImageLoadQueue = [];
@@ -1820,7 +1820,7 @@ if (atrLazyCoverObserver) { try { atrLazyCoverObserver.disconnect(); } catch(e){
 if (!list.length) { lib.innerHTML = q ? "Sin resultados para la búsqueda." : "Sin ATRs/XEX cargados."; return; }
 if (mode === "flat") {
 lib.innerHTML = list.map(atrLibraryRowHtml).join("");
-setTimeout(atrInitLazyCovers, 0);
+setTimeout(atrInitLazyCovers, 350);
 return;
 }
 const groups = {};
@@ -1837,7 +1837,7 @@ return `<details class="atr-folder-group">`+
 `<div class="atr-folder-body">${items.map(atrLibraryRowHtml).join("")}</div>`+
 `</details>`;
 }).join("");
-setTimeout(atrInitLazyCovers, 0);
+setTimeout(atrInitLazyCovers, 350);
 }
 let btSioSaveTimer = null;
 let btSioSaving = false;
@@ -3006,9 +3006,10 @@ if (typeof atrThumbClearMissingF49Z41 === "function") atrThumbClearMissingF49Z41
 localStorage.removeItem("atrCoverMissingV29");
 localStorage.removeItem("atrCoverOkV29");
 localStorage.removeItem("atrCoverModeV29");
+localStorage.removeItem("atariSio.cover.missing.f43m.v1");
 } catch(e) {}
 if (typeof setStatus === "function") setStatus("Cache local de carátulas limpiada", true);
-if (typeof loadAtrStatus === "function") loadAtrStatus({ files:true, force:true, forceCovers:true, forceLibrary:true });
+if (typeof loadAtrStatus === "function") loadAtrStatus({ files:false, force:true, forceCovers:true, forceLibrary:false });
 }
 function atrCoverModeFix3Bind() {
 atrCoverModeFix3Apply(atrCoverModeFix3);
@@ -3950,16 +3951,45 @@ return "";
 }
 function atrLibraryCoverActionsHtml(fileName) {
 const safeName = atrCoverEscapeAttr(fileName || "");
-let h = `<div class="atr-cover-library-actions">`;
-h += `<button type="button" class="atr-cover-mini-btn" onclick="atrPromptManualCover(0, this.dataset.name)" data-name="${safeName}">Agregar URL</button>`;
-h += `<button type="button" class="atr-cover-mini-btn" onclick="atrUploadLocalCover(this.dataset.name)" data-name="${safeName}">Subir imagen</button>`;
-h += `<button type="button" class="atr-cover-mini-btn" onclick="window.open(ATR_LIBRETRO_BOXART_BASE, '_blank')">Abrir Libretro</button>`;
-h += `<button type="button" class="atr-cover-mini-btn" onclick="atrUseProxyCoverLibrary(this.dataset.name)" data-name="${safeName}">Guardar proxy SD</button>`;
+let h = `<details class="mock-card-menu atr-cover-dot-menu atr-cover-inline-menu">`;
+h += `<summary class="atr-cover-dot-summary" title="Imágenes">.</summary>`;
+h += `<div class="mock-card-menu-body atr-cover-dot-menu-body">`;
+h += `<button type="button" class="atr-cover-mini-btn" data-action="manual" data-name="${safeName}" onclick="atrLibraryCoverActionFromButton(this)">Agregar URL</button>`;
+h += `<button type="button" class="atr-cover-mini-btn" data-action="upload" data-name="${safeName}" onclick="atrLibraryCoverActionFromButton(this)">Subir imagen</button>`;
+h += `<button type="button" class="atr-cover-mini-btn" data-action="libretro" data-name="${safeName}" onclick="atrLibraryCoverActionFromButton(this)">Abrir Libretro</button>`;
+h += `<button type="button" class="atr-cover-mini-btn" data-action="proxy" data-name="${safeName}" onclick="atrLibraryCoverActionFromButton(this)">Guardar proxy SD</button>`;
 if (atrManualCoverGet(fileName)) {
-h += `<button type="button" class="atr-cover-mini-btn" onclick="atrRemoveManualCover(0, this.dataset.name)" data-name="${safeName}">Quitar manual</button>`;
+h += `<button type="button" class="atr-cover-mini-btn" data-action="remove" data-name="${safeName}" onclick="atrLibraryCoverActionFromButton(this)">Quitar manual</button>`;
 }
-h += `</div>`;
+h += `</div></details>`;
 return h;
+}
+function atrLibraryCoverActionFromButton(btn) {
+if (!btn) return false;
+const action = (btn.dataset && btn.dataset.action) ? btn.dataset.action : "";
+const fileName = (btn.dataset && btn.dataset.name) ? btn.dataset.name : "";
+try { const d = btn.closest ? btn.closest("details") : null; if (d) d.open = false; } catch(_e) {}
+return atrLibraryCoverAction(action, fileName);
+}
+function atrLibraryCoverActionFromSelect(sel) {
+if (!sel) return false;
+const action = sel.value || "";
+const fileName = (sel.dataset && sel.dataset.name) ? sel.dataset.name : "";
+sel.value = "";
+return atrLibraryCoverAction(action, fileName);
+}
+function atrLibraryCoverAction(action, fileName) {
+if (!action) return false;
+try {
+if (action === "manual") return atrPromptManualCover(0, fileName);
+if (action === "upload") return atrUploadLocalCover(fileName);
+if (action === "libretro") { window.open(ATR_LIBRETRO_BOXART_BASE, "_blank"); return false; }
+if (action === "proxy") { atrUseProxyCoverLibrary(fileName); return false; }
+if (action === "remove") return atrRemoveManualCover(0, fileName);
+} catch(e) {
+try { console.warn("atrLibraryCoverAction", e); } catch(_e) {}
+}
+return false;
 }
 async function atrUseProxyCoverLibrary(fileName) {
 try {
@@ -4048,7 +4078,7 @@ await atrServerCoverDelete(fileName);
 } catch(e) {}
 atrManualCoverDelete(fileName);
 delete atrCoverResolvedCache[atrCoverCacheKey(fileName)];
-if (typeof loadAtrStatus === "function") loadAtrStatus({ files:true, force:true, forceCovers:true, forceLibrary:true });
+if (typeof loadAtrStatus === "function") loadAtrStatus({ files:false, force:true, forceCovers:true, forceLibrary:false });
 }
 // =============================================================
 // F27 - Render Biblioteca tipo mockup real
@@ -5465,7 +5495,7 @@ if (summary && n && !files.length) summary.textContent = `${txt} · cargando lis
 return n;
 }
 async function fetchLibraryNamesF49Z21(){
-const r = await fetch('/api/library?_=' + Date.now(), { cache:'no-store' });
+const r = await fetch('/api/library?refresh=0&page=0&pageSize=50&_=' + Date.now(), { cache:'no-store' });
 if (!r.ok) throw new Error('HTTP ' + r.status);
 const j = await r.json();
 const arr = Array.isArray(j.files) ? j.files : [];
@@ -6745,21 +6775,37 @@ const boot=()=>{apply(kind(location.pathname)||'home',true);setTimeout(()=>apply
   if(window.__libraryFinalControllerF22)return;
   window.__libraryFinalControllerF22=1;
   window.__libraryFinalControllerF21=1;
-  const TAG='F31_LIBRARY_LEGACY_NEUTRALIZED_FIX';
+  const TAG='F43U_LIBRARY_IMAGE_DOT_MENU';
   const TYPES=['ALL','ATR','XEX','COM','EXE','BAS','CAS','SEC','OTHER'];
   const MOUNT_TYPES=['ATR','XEX','COM','EXE','SEC'];
-  const state={files:[],payload:null,page:0,pageSize:24,type:'ALL',query:'',sort:'name',refreshing:false,timer:null,lastJsonOk:false,lastJsonCount:0,visibleMask:15,statusMask:0,statusForceMask:0,coverQueue:[],coverActive:0,rendering:false};
+  const state={files:[],payload:null,page:0,pageSize:24,type:'ALL',query:'',sort:'name',refreshing:false,timer:null,lastJsonOk:false,lastJsonCount:0,visibleMask:15,statusMask:0,statusForceMask:0,coverQueue:[],coverActive:0,coverObserver:null,rendering:false,lastLoadAt:0,browserCacheAt:0,browserCacheUsed:false};
   const $=id=>document.getElementById(id);
   const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const enc=v=>encodeURIComponent(String(v==null?'':v));
   const isLibrary=()=>!!(document.body&&document.body.classList&&document.body.classList.contains('route-library'))||location.pathname.indexOf('/library')===0||location.pathname.indexOf('/upload')===0||location.pathname.indexOf('/editor/library')===0;
   const isAtr=()=>!!(document.body&&document.body.classList&&document.body.classList.contains('route-webatr'))||location.pathname.indexOf('/atr')===0||location.pathname.indexOf('/webatr')===0||location.pathname.indexOf('/editor/web-atr')===0||location.pathname.indexOf('/editor/webatr')===0;
+  // F43M: cache del listado en el navegador. No reemplaza la SD: solo evita pedir /api/library
+  // al entrar/cambiar de pantalla si el usuario ya refrescó la Biblioteca. El botón Refrescar
+  // sigue siendo la única acción que escanea la SD.
+  const LIB_BROWSER_CACHE_KEY='atariSio.library.files.f43m.v1';
+  const LIB_BROWSER_CACHE_TTL_MS=7*24*60*60*1000;
+  const COVER_MISSING_KEY_F43M='atariSio.cover.missing.f43m.v1';
+  function compactFileForBrowserCache(f){f=f||{}; return {name:f.name||'',path:f.path||'',type:f.type||'',valid:f.valid==null?1:Number(f.valid||0),mountable:f.mountable==null?null:Number(f.mountable||0),fileSize:Number(f.fileSize||0)||0,sectorSize:Number(f.sectorSize||0)||0,totalSectors:Number(f.totalSectors||0)||0,mountedMask:Number(f.mountedMask||0)||0,casMounted:Number(f.casMounted||0)||0,protected:!!f.protected,casAnalyzed:Number(f.casAnalyzed||0)||0,casOverride:Number(f.casOverride||0)||0,casOverrideProfile:String(f.casOverrideProfile||'AUTO'),casEffectiveProfile:String(f.casEffectiveProfile||f.casProfile||f.casAutoProfile||'AUTO'),casProfile:String(f.casProfile||''),casAutoProfile:String(f.casAutoProfile||''),casConfidence:String(f.casConfidence||''),casInitialBaud:Number(f.casInitialBaud||0)||0,casFirstDataBaud:Number(f.casFirstDataBaud||0)||0,casTurboBaud:Number(f.casTurboBaud||0)||0,casMaxBaud:Number(f.casMaxBaud||0)||0,casDataBlocks:Number(f.casDataBlocks||0)||0,casBaudChunks:Number(f.casBaudChunks||0)||0,casFskChunks:Number(f.casFskChunks||0)||0,casPwmChunks:Number(f.casPwmChunks||0)||0};}
+  function browserCacheSave(files,payload){try{if(!Array.isArray(files)||!files.length)return false; const data={v:1,at:Date.now(),files:files.map(compactFileForBrowserCache),payload:{source:'browser_storage',total:Number((payload&&payload.total)||files.length),indexCount:Number((payload&&payload.indexCount)||files.length),typeCounts:(payload&&payload.typeCounts)||null}}; localStorage.setItem(LIB_BROWSER_CACHE_KEY,JSON.stringify(data)); state.browserCacheAt=data.at; return true;}catch(e){console.warn(TAG,'browserCacheSave',e&&e.message?e.message:e); return false;}}
+  function browserCacheLoad(){try{const raw=localStorage.getItem(LIB_BROWSER_CACHE_KEY); if(!raw)return null; const data=JSON.parse(raw); if(!data||!Array.isArray(data.files)||!data.files.length)return null; const age=Date.now()-Number(data.at||0); if(age>LIB_BROWSER_CACHE_TTL_MS)return null; return data;}catch(e){console.warn(TAG,'browserCacheLoad',e&&e.message?e.message:e); return null;}}
+  function browserCacheClear(){try{localStorage.removeItem(LIB_BROWSER_CACHE_KEY);}catch(e){} state.browserCacheAt=0; state.browserCacheUsed=false;}
+  function coverMissingDb(){try{return JSON.parse(localStorage.getItem(COVER_MISSING_KEY_F43M)||'{}')||{};}catch(e){return {};}}
+  function coverMissingKey(name){return normKey(name||'');}
+  function coverIsMissing(name){const k=coverMissingKey(name); if(!k)return false; const db=coverMissingDb(); const t=Number(db[k]||0); if(!t)return false; if(Date.now()-t>24*60*60*1000){delete db[k]; try{localStorage.setItem(COVER_MISSING_KEY_F43M,JSON.stringify(db));}catch(e){} return false;} return true;}
+  function coverMarkMissing(name){const k=coverMissingKey(name); if(!k)return; const db=coverMissingDb(); db[k]=Date.now(); try{localStorage.setItem(COVER_MISSING_KEY_F43M,JSON.stringify(db));}catch(e){}}
+  function coverClearMissing(){try{localStorage.removeItem(COVER_MISSING_KEY_F43M);}catch(e){}}
+
   function base(p){p=String(p||'').split(String.fromCharCode(92)).join('/'); const i=p.lastIndexOf('/'); return i>=0?p.slice(i+1):p;}
   function noExt(n){n=String(n||''); const i=n.lastIndexOf('.'); return i>0?n.slice(0,i):n;}
   function normKey(v){return base(String(v||'')).trim().toLowerCase();}
   function extOf(n){n=base(n); const i=n.lastIndexOf('.'); return i>=0?n.slice(i+1).toUpperCase():'';}
   function typeOf(f){let src=String((f&&f.name)||base(f&&f.path)||f||''); let t=extOf(src)||String((f&&f.type)||'').replace('.','').toUpperCase(); return TYPES.includes(t)?t:'OTHER';}
-  function norm(f){f=f||{}; const p=String(f.path||f.fullPath||f.file||'').trim(); const n=String(f.name||f.filename||base(p)||'').trim(); return {raw:f,name:n,path:p||n,type:typeOf({name:n,path:p,type:f.type}),valid:(f.valid==null?null:Number(f.valid||0)),fileSize:Number(f.fileSize!=null?f.fileSize:(f.size||0))||0,sectorSize:Number(f.sectorSize||0)||0,totalSectors:Number(f.totalSectors||0)||0,mountedMask:Number(f.mountedMask||0)||0,casMounted:Number(f.casMounted||0)||0,protected:!!f.protected,pendingCas:false,pendingMount:0};}
+  function norm(f){f=f||{}; const p=String(f.path||f.fullPath||f.file||'').trim(); const n=String(f.name||f.filename||base(p)||'').trim(); return {raw:f,name:n,path:p||n,type:typeOf({name:n,path:p,type:f.type}),valid:(f.valid==null?null:Number(f.valid||0)),fileSize:Number(f.fileSize!=null?f.fileSize:(f.size||0))||0,sectorSize:Number(f.sectorSize||0)||0,totalSectors:Number(f.totalSectors||0)||0,mountedMask:Number(f.mountedMask||0)||0,casMounted:Number(f.casMounted||0)||0,protected:!!f.protected,mountable:(f.mountable==null?null:Number(f.mountable||0)),pendingCas:false,pendingMount:0,pendingAnalyze:false,pendingProfile:false,casAnalyzed:Number(f.casAnalyzed||0)||0,casOverride:Number(f.casOverride||0)||0,casOverrideProfile:String(f.casOverrideProfile||'AUTO'),casEffectiveProfile:String(f.casEffectiveProfile||f.casProfile||f.casAutoProfile||'AUTO'),casProfile:String(f.casProfile||f.casAutoProfile||''),casAutoProfile:String(f.casAutoProfile||f.casProfile||''),casConfidence:String(f.casConfidence||''),casInitialBaud:Number(f.casInitialBaud||0)||0,casFirstDataBaud:Number(f.casFirstDataBaud||0)||0,casTurboBaud:Number(f.casTurboBaud||0)||0,casMaxBaud:Number(f.casMaxBaud||0)||0,casDataBlocks:Number(f.casDataBlocks||0)||0,casBaudChunks:Number(f.casBaudChunks||0)||0,casFskChunks:Number(f.casFskChunks||0)||0,casPwmChunks:Number(f.casPwmChunks||0)||0};}
   function fileKey(f){return f.path||f.name||'';}
   function sameFile(f,key){const k=String(key||'').toLowerCase(); const bk=normKey(k); if(!f||!k)return false; return String(f.path||'').toLowerCase()===k||String(f.name||'').toLowerCase()===k||normKey(f.path)===bk||normKey(f.name)===bk;}
   function sorter(a,b){if(state.sort==='type'){const c=typeOf(a).localeCompare(typeOf(b),'es'); if(c)return c;} if(state.sort==='size'){const c=(b.fileSize||0)-(a.fileSize||0); if(c)return c;} return String(a.name||'').localeCompare(String(b.name||''),'es',{numeric:true,sensitivity:'base'});}
@@ -6768,11 +6814,19 @@ const boot=()=>{apply(kind(location.pathname)||'home',true);setTimeout(()=>apply
   function filtered(){let arr=state.files.slice(); const q=String(state.query||'').trim().toLowerCase(); if(state.type&&state.type!=='ALL')arr=arr.filter(f=>typeOf(f)===state.type); if(q)arr=arr.filter(f=>String(f.name||'').toLowerCase().includes(q)||String(f.path||'').toLowerCase().includes(q)||typeOf(f).toLowerCase().includes(q)); return arr.sort(sorter);}
   function human(n){n=Number(n||0); if(!n)return '—'; if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(n<10240?1:0)+' KB'; return (n/1048576).toFixed(1)+' MB';}
   function maskToUnitsLocal(mask){mask=Number(mask||0); const a=[]; for(let i=1;i<=7;i++)if(mask&(1<<(i-1)))a.push('D'+i); return a.length?a.join('+'):'—';}
-  function isWebAtrMountableFile(f){const t=typeOf(f); const valid=(f&&f.valid==null)?(t==='ATR'):(Number(f&&f.valid||0)!==0); return t==='ATR' ? valid : (MOUNT_TYPES.includes(t)&&valid&&!!(Number(f.sectorSize||0)||Number(f.totalSectors||0)));}
+  function isWebAtrMountableFile(f){const t=typeOf(f); if(!MOUNT_TYPES.includes(t))return false; const valid=(f&&f.valid==null)?1:(Number(f&&f.valid||0)!==0); if(!valid)return false; if(f&&f.mountable!=null)return Number(f.mountable||0)!==0; if(t==='ATR')return true; if(t==='XEX'||t==='COM'||t==='EXE')return Number(f&&f.fileSize||0)>0; return false;}
   function visibleUnits(){let units=[]; let mask=Number(state.visibleMask||15); for(let i=1;i<=7;i++){if(mask & (1<<(i-1)))units.push(i);} if(!units.length)units=[1,2,3,4]; return units;}
   function coverUrl(name){try{if(typeof atrCoverThumbNameSrc==='function')return atrCoverThumbNameSrc(name);}catch(e){} return '/api/covers/thumb?name='+enc(name);}
   function coverFullUrl(name){try{if(typeof atrCoverProxyNameSrc==='function')return atrCoverProxyNameSrc(name);}catch(e){} return '/api/covers/proxy?name='+enc(name);}
-  function cover(name){const safe=esc(name||''); return '<img class="atr-lib-cover f22-lazy-cover" loading="lazy" decoding="async" fetchpriority="low" alt="Carátula" data-f22-cover="1" data-src="'+esc(coverUrl(name))+'" data-full="'+esc(coverFullUrl(name))+'" data-title="'+safe+'"><div class="atr-lib-cover-box f22-cover-miss" style="display:none">Sin<br>carátula</div>';}
+  function cover(name){const safe=esc(name||''); if(coverIsMissing(name))return '<div class="atr-lib-cover-box f22-cover-miss">Sin<br>carátula</div>'; return '<img class="atr-lib-cover f22-lazy-cover" loading="lazy" decoding="async" fetchpriority="low" alt="Carátula" data-f22-cover="1" data-src="'+esc(coverUrl(name))+'" data-full="'+esc(coverFullUrl(name))+'" data-title="'+safe+'"><div class="atr-lib-cover-box f22-cover-miss" style="display:none">Sin<br>carátula</div>';}
+
+  const CAS_PROFILES=['AUTO','NORMAL_600','IRON_STD_600','TURBO_SOFTWARE_V2_800','STAC_PROBABLE','CAIN_217_PROBABLE','INJEKTOR_6000','TURBO_2000','TURBO_2600','KSO_T2000F','COLD_PRISM_4000','TURBO_6000_CHAOS','PWM_TURBO','FSK_ESPECIAL','RAW_BIN','UNKNOWN_TURBO'];
+  function casProfileLabel(p){p=String(p||'AUTO').toUpperCase(); const map={AUTO:'AUTO',NORMAL_600:'NORMAL 600',IRON_STD_600:'IRON 600',TURBO_SOFTWARE:'TURBO 800',TURBO_SOFTWARE_V2_800:'TURBO 800',STAC_PROBABLE:'STAC',CAIN_217_PROBABLE:'CAIN',INJEKTOR_4000:'INJEKTOR 4000',INJEKTOR_6000:'INJEKTOR 6000',TURBO_2000:'TURBO 2000',TURBO_2600:'TURBO 2600',KSO_T2000F:'KSO/T2000F',COLD_PRISM_4000:'COLD PRISM',TURBO_6000_CHAOS:'CHAOS 6000',PWM_TURBO:'PWM TURBO',FSK_ESPECIAL:'FSK',RAW_BIN:'RAW',UNKNOWN_TURBO:'TURBO ?'}; return map[p]||p.replace(/_/g,' ');}
+  function casEffectiveProfile(f){return String((f&&f.casOverride?f.casOverrideProfile:'')||(f&&f.casEffectiveProfile)||(f&&f.casProfile)||(f&&f.casAutoProfile)||'AUTO').toUpperCase();}
+  function casProfileClass(p){p=String(p||'AUTO').toUpperCase(); if(p.indexOf('NORMAL')>=0||p==='AUTO')return 'normal'; if(p.indexOf('IRON')>=0)return 'iron'; if(p.indexOf('TURBO')>=0||p.indexOf('INJEKTOR')>=0||p.indexOf('KSO')>=0||p.indexOf('PRISM')>=0||p.indexOf('CHAOS')>=0)return 'turbo'; if(p.indexOf('STAC')>=0||p.indexOf('CAIN')>=0)return 'special'; return 'unknown';}
+  function casProfileHtml(f){if(typeOf(f)!=='CAS')return ''; const prof=casEffectiveProfile(f); const auto=String(f.casProfile||f.casAutoProfile||''); const conf=String(f.casConfidence||''); const override=Number(f.casOverride||0); const details=[]; if(f.casAnalyzed)details.push(conf?('Conf. '+conf):'Analizado'); else details.push('Sin analizar'); if(f.casTurboBaud)details.push('turbo '+f.casTurboBaud+' bps'); else if(f.casMaxBaud)details.push('max '+f.casMaxBaud+' bps'); if(f.casBaudChunks)details.push('baud chunks '+f.casBaudChunks); if(f.casFskChunks)details.push('FSK '+f.casFskChunks); return '<div class="cas-profile-box"><div class="cas-profile-head"><span class="cas-profile-badge '+casProfileClass(prof)+'">'+esc(casProfileLabel(prof))+'</span>'+(override?'<span class="cas-profile-override">Manual</span>':'')+'</div><div class="cas-profile-detail">'+esc(details.join(' · '))+(auto&&override?' · Auto: '+esc(casProfileLabel(auto)):'')+'</div></div>';}
+  function casProfileControlsHtml(f){if(typeOf(f)!=='CAS')return ''; const key=fileKey(f); const value=String(f.casOverride?f.casOverrideProfile:'AUTO').toUpperCase(); const opts=CAS_PROFILES.map(p=>'<option value="'+esc(p)+'" '+(value===p?'selected':'')+'>'+esc(casProfileLabel(p))+'</option>').join(''); return '<div class="cas-profile-actions"><button type="button" class="secondary cas-analyze-btn" data-f22-action="cas-analyze" data-file="'+esc(key)+'">'+(f.pendingAnalyze?'Analizando...':'Analizar CAS')+'</button><label class="cas-profile-select-label">Perfil <select class="small-input cas-profile-select" data-f22-profile-file="'+esc(key)+'" '+(f.pendingProfile?'disabled':'')+'>'+opts+'</select></label></div>';}
+
   function unitsHtml(f){const t=typeOf(f); const key=fileKey(f); let html='';
     if(t==='CAS'){
       if(f.pendingCas) html='<span class="mounted-badge mock-mounted-badge">Preparando C:...</span>';
@@ -6783,24 +6837,54 @@ const boot=()=>{apply(kind(location.pathname)||'home',true);setTimeout(()=>apply
       else if(f.mountedMask) html='<span class="mounted-badge mock-mounted-badge">Montado: '+esc(maskToUnitsLocal(f.mountedMask))+'</span>';
       else visibleUnits().forEach(i=>{html+='<button type="button" class="mock-unit-btn" data-f22-action="mount" data-unit="'+i+'" data-file="'+esc(key)+'">D'+i+'</button>';});
     } else html='<span class="pill">Solo listado</span>';
+    if(typeof atrLibraryCoverActionsHtml==='function') html += atrLibraryCoverActionsHtml(f.name);
     if(!f.protected && !f.mountedMask && !f.casMounted && !f.pendingCas && !f.pendingMount)html+='<button type="button" class="mock-unit-btn trash-btn" data-f22-action="delete" data-file="'+esc(key)+'">🗑</button>';
     return html;
   }
-  function card(f){const t=typeOf(f); const sub=esc(f.path&&f.path!==f.name?f.path:noExt(f.name)); return '<article class="mock-lib-card" data-file-name="'+esc(f.name)+'" data-file-path="'+esc(f.path)+'" data-file-type="'+esc(t)+'"><div class="mock-lib-cover-wrap"><span class="mock-lib-type">'+esc(t)+'</span>'+cover(f.name)+'</div><div class="mock-lib-title" title="'+esc(f.name)+'">'+esc(f.name)+'</div><div class="mock-lib-subtitle" title="'+sub+'">'+sub+'</div><div class="mock-lib-meta"><span>'+human(f.fileSize)+'</span><span>'+(t==='CAS'?'Cassette':(f.sectorSize?esc(f.sectorSize+'B'):'—'))+'</span><span>'+(f.totalSectors?esc(f.totalSectors+' sec.'):'—')+'</span>'+(f.protected?'<span>Protegido</span>':'')+'</div><div class="mock-lib-units">'+unitsHtml(f)+'</div></article>';}
-  function ensureStyle(){if($('libraryF22Style'))return; const st=document.createElement('style'); st.id='libraryF22Style'; st.textContent='#atrLibrary,#atrLibraryPager,body.route-library #mockFilterChipsF27,body.route-library #libraryGridF19,body.route-library #libraryGridF20,body.route-library #libraryGridF21,body.route-library #libraryF19Pager,body.route-library #libraryF20Pager,body.route-library #libraryF21Pager,body.route-library #libraryF19Chips,body.route-library #libraryF20Chips,body.route-library #libraryF21Chips,body.route-library #libraryF19Diag,body.route-library #libraryF20Diag,body.route-library #libraryF21Diag{display:none!important} #libraryF22Chips{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0} #libraryF22Pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;margin:12px 0} #libraryGridF22.mock-lib-grid{display:grid!important;grid-template-columns:repeat(auto-fill,minmax(var(--lib-card-min,220px),1fr));gap:16px!important;margin-top:10px} #libraryF22Diag{font-size:12px;color:#9fb6c8;margin:6px 0 0}.f22-lazy-cover[data-loaded="1"]{display:block}.f22-lazy-cover[data-error="1"]{display:none}.mock-filter-chip[hidden]{display:none!important}'; document.head.appendChild(st);}
+  function card(f){const t=typeOf(f); const sub=esc(f.path&&f.path!==f.name?f.path:noExt(f.name)); return '<article class="mock-lib-card" data-file-name="'+esc(f.name)+'" data-file-path="'+esc(f.path)+'" data-file-type="'+esc(t)+'"><div class="mock-lib-cover-wrap"><span class="mock-lib-type">'+esc(t)+'</span>'+cover(f.name)+'</div><div class="mock-lib-title" title="'+esc(f.name)+'">'+esc(f.name)+'</div><div class="mock-lib-subtitle" title="'+sub+'">'+sub+'</div><div class="mock-lib-meta"><span>'+human(f.fileSize)+'</span><span>'+(t==='CAS'?'Cassette':(f.sectorSize?esc(f.sectorSize+'B'):'—'))+'</span><span>'+(f.totalSectors?esc(f.totalSectors+' sec.'):'—')+'</span>'+(f.protected?'<span>Protegido</span>':'')+'</div>'+casProfileHtml(f)+casProfileControlsHtml(f)+'<div class="mock-lib-units">'+unitsHtml(f)+'</div></article>';}
+  function ensureStyle(){if($('libraryF22Style'))return; const st=document.createElement('style'); st.id='libraryF22Style'; st.textContent='#atrLibrary,#atrLibraryPager,body.route-library #mockFilterChipsF27,body.route-library #libraryGridF19,body.route-library #libraryGridF20,body.route-library #libraryGridF21,body.route-library #libraryF19Pager,body.route-library #libraryF20Pager,body.route-library #libraryF21Pager,body.route-library #libraryF19Chips,body.route-library #libraryF20Chips,body.route-library #libraryF21Chips,body.route-library #libraryF19Diag,body.route-library #libraryF20Diag,body.route-library #libraryF21Diag{display:none!important} #libraryF22Chips{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0} #libraryF22Pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;margin:12px 0} #libraryGridF22.mock-lib-grid{display:grid!important;grid-template-columns:repeat(auto-fill,minmax(var(--lib-card-min,220px),1fr));gap:16px!important;margin-top:10px} #libraryF22Diag{font-size:12px;color:#9fb6c8;margin:6px 0 0}.f22-lazy-cover[data-loaded="1"]{display:block}.f22-lazy-cover[data-error="1"]{display:none}.mock-filter-chip[hidden]{display:none!important} #libraryGridF22 .mock-lib-card{overflow:visible!important} #libraryGridF22 .mock-lib-units{display:flex!important;flex-wrap:wrap!important;gap:4px!important;align-items:center!important;justify-content:center!important;position:relative!important;overflow:visible!important} #libraryGridF22 .mock-lib-units .mock-unit-btn{min-width:30px!important;min-height:25px!important;padding:3px 6px!important;border-radius:8px!important;font-size:.58rem!important;line-height:1!important} #libraryGridF22 .mock-lib-units .trash-btn{min-width:28px!important;padding:3px 6px!important} #libraryGridF22 .atr-cover-dot-menu{margin:0!important;display:inline-flex!important;position:static!important;flex:0 0 auto!important;justify-content:center!important;overflow:visible!important} #libraryGridF22 .mock-lib-units .atr-cover-dot-menu summary{width:30px!important;height:25px!important;min-width:30px!important;display:flex!important;align-items:center!important;justify-content:center!important;border-radius:8px!important;border:1px solid rgba(56,189,248,.42)!important;background:linear-gradient(135deg,#0ea5e9,#2563eb)!important;color:#fff!important;font-size:15px!important;font-weight:900!important;line-height:1!important;padding:0!important;cursor:pointer!important;list-style:none!important;position:relative!important;z-index:61!important} #libraryGridF22 .mock-lib-units .atr-cover-dot-menu summary::-webkit-details-marker{display:none!important} #libraryGridF22 .mock-lib-units .atr-cover-dot-menu[open]{display:inline-flex!important;flex-direction:row!important;align-items:center!important;margin:0!important;z-index:60!important} #libraryGridF22 .mock-lib-units .atr-cover-dot-menu[open] summary{margin:0!important} #libraryGridF22 .atr-cover-dot-menu-body{position:absolute!important;left:50%!important;right:auto!important;top:auto!important;bottom:calc(100% + 6px)!important;transform:translateX(-50%)!important;width:min(188px, calc(100% - 20px))!important;min-width:150px!important;max-width:188px!important;margin:0!important;z-index:60!important} #libraryGridF22 .atr-cover-dot-menu-body .atr-cover-mini-btn{width:100%!important;text-align:center!important;justify-content:center!important;border-radius:9px!important;padding:5px 7px!important;font-size:10px!important;line-height:1.1!important}'; document.head.appendChild(st);}
   function ensureUi(){ensureStyle(); const block=$('atrLibraryPageBlock'); if(!block)return; ['atrLibrary','atrLibraryPager','libraryGridF19','libraryGridF20','libraryGridF21','libraryF19Pager','libraryF20Pager','libraryF21Pager'].forEach(id=>{const el=$(id); if(el){try{el.innerHTML=''; el.remove();}catch(e){el.style.display='none';}}}); let chips=$('libraryF22Chips'); if(!chips){chips=document.createElement('div'); chips.id='libraryF22Chips'; chips.className='mock-filter-chips'; const row=block.querySelector('.library-refresh-row')||block.querySelector('.library-toolbar-main')||block.firstChild; if(row&&row.parentNode)row.parentNode.insertBefore(chips,row.nextSibling); else block.appendChild(chips);} let diag=$('libraryF22Diag'); if(!diag){diag=document.createElement('div'); diag.id='libraryF22Diag'; chips.parentNode.insertBefore(diag,chips.nextSibling);} let sort=$('atrLibrarySortF22'); if(!sort){const lab=document.createElement('label'); lab.className='label'; lab.style.cssText='display:flex;align-items:center;gap:6px;'; lab.innerHTML='Orden <select id="atrLibrarySortF22" class="small-input"><option value="name">Nombre</option><option value="type">Tipo</option><option value="size">Tamaño</option></select>'; const tb=block.querySelector('.library-toolbar-main')||block; tb.appendChild(lab);} let pager=$('libraryF22Pager'); if(!pager){pager=document.createElement('div'); pager.id='libraryF22Pager'; pager.className='library-pager'; const oldPager=$('libraryF21Pager')||$('libraryF20Pager')||$('libraryF19Pager')||$('atrLibraryPager'); if(oldPager&&oldPager.parentNode)oldPager.parentNode.insertBefore(pager,oldPager.nextSibling); else block.appendChild(pager);} let grid=$('libraryGridF22'); if(!grid){grid=document.createElement('div'); grid.id='libraryGridF22'; grid.className='mock-lib-grid'; const old=$('libraryGridF21')||$('libraryGridF20')||$('libraryGridF19')||$('atrLibrary'); if(old&&old.parentNode)old.parentNode.insertBefore(grid,old); else block.appendChild(grid);} setCoverDefaultAll();}
-  function setCoverDefaultAll(){try{localStorage.setItem('atrCoverModeV29Fix3','all'); localStorage.setItem('atrCoverModeV29','all'); localStorage.setItem('atrCoverModeF22Default','all'); document.body.classList.remove('cover-mode-off'); ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el)el.value='all';}); ['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(id=>{const el=$(id); if(el)el.textContent='Todas lentamente';});}catch(e){}}
+  function setCoverDefaultAll(){try{let mode=localStorage.getItem('atrCoverModeV29Fix3')||localStorage.getItem('atrCoverModeV29')||'manual'; if(mode==='all')mode='visible'; localStorage.setItem('atrCoverModeV29Fix3',mode); localStorage.setItem('atrCoverModeV29',mode); localStorage.setItem('atrCoverModeF43Default','manual'); document.body.classList.toggle('cover-mode-off',mode==='off'); ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el)el.value=mode;}); ['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(id=>{const el=$(id); if(el)el.textContent=(mode==='off'?'Imágenes apagadas':(mode==='manual'?'Manual':'Solo visibles'));});}catch(e){}}
   function updateCounts(c){if(state.type!=='ALL' && !Number(c[state.type]||0)){state.type='ALL'; state.page=0;} ['atrLibraryCount','atrUploadLibraryCount','atrMountLibraryCount','homeLibraryCount'].forEach(id=>{const el=$(id); if(el)el.textContent=state.files.length+' archivo'+(state.files.length===1?'':'s')}); const chips=$('libraryF22Chips'); if(chips){chips.innerHTML=TYPES.filter(t=>t==='ALL'||Number(c[t]||0)>0).map(t=>'<button type="button" class="mock-filter-chip '+(state.type===t?'active':'')+'" data-f22-filter="'+t+'">'+(t==='ALL'?'Todos':t)+' <span>'+Number(c[t]||0)+'</span></button>').join('');}}
   function render(reason){if(!isLibrary())return; ensureUi(); state.rendering=true; try{ const search=$('atrLibrarySearch'); if(search)state.query=search.value||''; const sort=$('atrLibrarySortF22'); if(sort)state.sort=sort.value||state.sort; const grid=$('libraryGridF22'); if(!grid)return; const c=counts(state.files); updateCounts(c); const list=filtered(); const total=list.length; const pages=Math.max(1,Math.ceil(total/state.pageSize)); if(state.page>=pages)state.page=pages-1; if(state.page<0)state.page=0; const start=state.page*state.pageSize; const pageList=list.slice(start,start+state.pageSize); const summary=$('atrLibrarySummary'); if(summary)summary.textContent=(state.files.length?total+' de '+state.files.length+' archivos':'Sin archivos')+' · ATR '+c.ATR+' · XEX '+c.XEX+' · COM '+c.COM+' · EXE '+c.EXE+' · BAS '+c.BAS+' · CAS '+c.CAS+' · unidades visibles '+visibleUnits().map(i=>'D'+i).join(', ')+' · página '+(state.page+1)+'/'+pages; const diag=$('libraryF22Diag'); if(diag)diag.textContent='Render F30 · '+(reason||'')+' · WEB-ATR sync mask=0x'+Number(state.statusMask||0).toString(16).toUpperCase()+' · JSON SD '+(state.lastJsonOk?'OK '+state.lastJsonCount+'/'+(state.payload&&state.payload.indexCount||state.files.length):'pendiente'); const pager=$('libraryF22Pager'); if(pager){pager.innerHTML='<button id="btnLibraryPrevF22" type="button" class="secondary" '+(state.page<=0?'disabled':'')+'>◀ Anterior</button><span class="library-page-info">Página '+(state.page+1)+' / '+pages+' · '+total+' resultado'+(total===1?'':'s')+'</span><button id="btnLibraryNextF22" type="button" class="secondary" '+(state.page>=pages-1?'disabled':'')+'>Siguiente ▶</button><label class="library-page-size">Por página <select id="atrLibraryPageSizeF22" class="small-input"><option value="12">12</option><option value="24">24</option><option value="48">48</option><option value="96">96</option></select></label>'; const ps=$('atrLibraryPageSizeF22'); if(ps)ps.value=String(state.pageSize);} if(!state.files.length)grid.innerHTML='<div class="mock-lib-empty">Sin archivos cargados. Presiona Refrescar biblioteca para construir el índice SD.</div>'; else if(!pageList.length)grid.innerHTML='<div class="mock-lib-empty">Sin resultados para la búsqueda/filtro actual.</div>'; else grid.innerHTML=pageList.map(f=>{try{return card(f)}catch(e){return '<article class="mock-lib-card"><b>'+esc(f&&f.name||'archivo')+'</b><small>Error tarjeta: '+esc(e&&e.message?e.message:e)+'</small></article>'}}).join(''); loadCovers(); populateWebAtr(); } finally {state.rendering=false;} }
   function updateVisibleCardUnits(){const grid=$('libraryGridF22'); if(!grid)return; grid.querySelectorAll('.mock-lib-card').forEach(card=>{const key=card.getAttribute('data-file-path')||card.getAttribute('data-file-name')||''; const f=state.files.find(x=>sameFile(x,key)); const units=card.querySelector('.mock-lib-units'); if(f&&units)units.innerHTML=unitsHtml(f); card.classList.toggle('mounted',!!(f&&(f.mountedMask||f.casMounted)));}); populateWebAtr();}
   function populateWebAtr(){const list=state.files.filter(isWebAtrMountableFile).sort(sorter); const c=counts(list); let html='<option value="">— sin montar — ('+list.length+' archivos)</option><option value="" disabled>Total: '+list.length+' · ATR: '+c.ATR+' · XEX: '+c.XEX+' · COM: '+c.COM+' · EXE: '+c.EXE+'</option>'; list.forEach(f=>html+='<option value="'+esc(fileKey(f))+'">['+esc(typeOf(f))+'] '+esc(f.name)+'</option>'); for(let i=1;i<=7;i++){const sel=$('atrSel'+i); if(sel){const val=sel.value||''; sel.innerHTML=html; if(val)sel.value=val;}}}
-  function loadCovers(){setCoverDefaultAll(); const grid=$('libraryGridF22'); if(!grid)return; const imgs=Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')); imgs.forEach(img=>{if(!img.dataset.queued){img.dataset.queued='1'; state.coverQueue.push(img);}}); pumpCovers();}
-  function pumpCovers(){while(state.coverActive<3&&state.coverQueue.length){const img=state.coverQueue.shift(); if(!img||!document.body.contains(img))continue; state.coverActive++; const done=(ok)=>{state.coverActive=Math.max(0,state.coverActive-1); if(ok){img.dataset.loaded='1'; try{if(typeof atrEnsureMiniCoverFromImage==='function')setTimeout(()=>atrEnsureMiniCoverFromImage(img,img.dataset.title||''),1200)}catch(e){}} else {img.dataset.error='1'; img.style.display='none'; const n=img.nextElementSibling; if(n)n.style.display='flex';} setTimeout(pumpCovers,180);}; img.onload=()=>done(true); img.onerror=()=>done(false); img.src=img.dataset.src;}}
+  function coverMode(){try{return localStorage.getItem('atrCoverModeV29Fix3')||localStorage.getItem('atrCoverModeV29')||'manual'}catch(e){return 'manual'}}
+  function queueCover(img){if(!img||img.dataset.queued||img.dataset.loaded==='1'||img.dataset.error==='1')return; img.dataset.queued='1'; state.coverQueue.push(img); pumpCovers();}
+  function loadCovers(){setCoverDefaultAll(); const grid=$('libraryGridF22'); if(!grid)return; const mode=coverMode(); if(mode==='off'||mode==='manual')return; const imgs=Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')); const start=()=>{ if(mode==='all'){imgs.slice(0,4).forEach(queueCover);return;} if('IntersectionObserver' in window){ if(!state.coverObserver){state.coverObserver=new IntersectionObserver((ents)=>{ents.forEach(en=>{if(en.isIntersecting){try{state.coverObserver.unobserve(en.target)}catch(e){} queueCover(en.target);}})},{root:null,rootMargin:'40px 0px',threshold:0.01});} imgs.forEach(img=>{try{state.coverObserver.observe(img)}catch(e){queueCover(img)}}); } else imgs.slice(0,4).forEach(queueCover); }; setTimeout(start, 420);}
+  function pumpCovers(){while(state.coverActive<1&&state.coverQueue.length){const img=state.coverQueue.shift(); if(!img||!document.body.contains(img))continue; state.coverActive++; const done=(ok)=>{state.coverActive=Math.max(0,state.coverActive-1); if(ok){img.dataset.loaded='1'; try{if(typeof atrEnsureMiniCoverFromImage==='function')setTimeout(()=>atrEnsureMiniCoverFromImage(img,img.dataset.title||''),2200)}catch(e){}} else {coverMarkMissing(img.dataset.title||''); img.dataset.error='1'; img.style.display='none'; const n=img.nextElementSibling; if(n)n.style.display='flex';} setTimeout(pumpCovers,320);}; img.onload=()=>done(true); img.onerror=()=>done(false); img.src=img.dataset.src;}}
+  function refreshCoverImages(){
+    try{
+      coverClearMissing();
+      if(typeof atrThumbClearMissingF49Z41==='function')atrThumbClearMissingF49Z41();
+      localStorage.removeItem('atrCoverMissingV29');
+      localStorage.removeItem('atrCoverOkV29');
+      localStorage.setItem('atrCoverModeV29Fix3','visible');
+      localStorage.setItem('atrCoverModeV29','visible');
+      setCoverDefaultAll();
+      state.coverQueue=[];
+      const grid=$('libraryGridF22');
+      if(grid){
+        Array.from(grid.querySelectorAll('img.f22-lazy-cover')).forEach(img=>{
+          delete img.dataset.queued; delete img.dataset.loaded; delete img.dataset.error;
+          img.removeAttribute('src'); img.style.display='';
+          const n=img.nextElementSibling; if(n)n.style.display='none';
+        });
+      }
+      render('refresh-cover-images');
+      setTimeout(()=>{try{loadCovers();}catch(e){}},220);
+      try{if(typeof loadAtrStatus==='function')loadAtrStatus({files:false, force:true, forceCovers:true, forceLibrary:false});}catch(e){}
+      try{if(typeof setStatus==='function')setStatus('Imágenes de Biblioteca actualizadas; se recargan las visibles.',true);}catch(e){}
+    }catch(e){console.warn(TAG,'refreshCoverImages',e&&e.message?e.message:e);}
+  }
   function xhrJson(url){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest(); x.open('GET',url,true); x.setRequestHeader('Cache-Control','no-store'); x.onreadystatechange=function(){if(x.readyState!==4)return; let p=null; try{p=JSON.parse(x.responseText||'{}')}catch(e){return reject(new Error('Respuesta JSON inválida en '+url))} if(x.status<200||x.status>=300||(p&&p.ok===false))return reject(new Error((p&&p.error)||('HTTP '+x.status))); resolve(p);}; x.onerror=()=>reject(new Error('Error de red en '+url)); x.send();});}
   async function refreshVisibleMask(){try{const v=await xhrJson('/api/drives/visible?_='+Date.now()); if(v&&v.visibleMask!=null)state.visibleMask=Number(v.visibleMask)||15;}catch(e){}}
   function syncFromAtrStatus(st){if(!st||!Array.isArray(st.slots))return false; if(st.driveVisibleMask!=null)state.visibleMask=Number(st.driveVisibleMask)||state.visibleMask; if(st.mask!=null)state.statusMask=Number(st.mask)||0; if(st.forceMask!=null)state.statusForceMask=Number(st.forceMask)||0; state.files.forEach(f=>{if(MOUNT_TYPES.includes(typeOf(f))){f.mountedMask=0; f.pendingMount=0;}}); st.slots.forEach(sl=>{const unit=Number(sl.unit||0); if(unit<1||unit>7)return; const bit=1<<(unit-1); const nm=String(sl.name||''); if(!nm)return; const active=(Number(sl.enabled||0)||Number(sl.forced||0)||Number(sl.present||0)); if(!active)return; const f=state.files.find(x=>sameFile(x,nm)); if(f)f.mountedMask=Number(f.mountedMask||0)|bit;}); return true;}
   async function syncDriveState(){try{const st=await xhrJson('/api/atr/status?files=0&fast=1&_='+Date.now()); if(syncFromAtrStatus(st)){try{window.lastAtrStatus=Object.assign(window.lastAtrStatus||{},st);}catch(e){} updateVisibleCardUnits(); return st;}}catch(e){console.warn(TAG,'syncDriveState',e&&e.message?e.message:e);} return null;}
   async function readIndexFallback(expected){
+    // F43P: no leer /api/library_index_json legacy; la fuente real es /CONFIG/library_index.ndjson.
+    state.lastJsonOk=true; state.lastJsonCount=Number(expected||0)||0; return null;
+    /*
   try{
     const txt = await new Promise((resolve,reject)=>{
       const x=new XMLHttpRequest();
@@ -6837,27 +6921,117 @@ const boot=()=>{apply(kind(location.pathname)||'home',true);setTimeout(()=>apply
     console.warn(TAG,'library_index_json no usable; se mantiene files[] de /api/library',e&&e.message?e.message:e);
   }
   return null;
+  */
 }
-  function logIndex(payload,idx){const expected=Number(payload&&payload.indexCount||payload&&payload.total||state.files.length||0); console.groupCollapsed('[Biblioteca F30] /CONFIG/library_index.json después de Refrescar'); console.log('Respuesta /api/library?refresh=1:',payload); console.log('Archivo JSON leído desde SD:',idx); console.log('Verificación cliente:',{jsonReadOk:Array.isArray(idx),jsonCount:Array.isArray(idx)?idx.length:0,expected,match:Array.isArray(idx)&&idx.length===expected}); console.groupEnd();}
+  function logIndex(payload,idx){const expected=Number(payload&&payload.indexCount||payload&&payload.total||state.files.length||0); console.groupCollapsed('[Biblioteca F43P] /CONFIG/library_index.ndjson después de Refrescar'); console.log('Respuesta /api/library?refresh=1&manual=1&commit=1:',payload); console.log('Fuente activa: NDJSON; legacy library_index.json deshabilitado'); console.log('Verificación cliente:',{expected,filesActuales:state.files.length,match:state.files.length===expected}); console.groupEnd();}
   function overlay(){let o=$('libraryRefreshFloatF22'); if(o)return o; o=document.createElement('div'); o.id='libraryRefreshFloatF22'; o.style.cssText='position:fixed;right:18px;bottom:18px;z-index:100000;width:min(390px,calc(100vw - 36px));padding:14px;border:1px solid rgba(56,189,248,.38);border-radius:18px;background:rgba(2,6,23,.97);box-shadow:0 20px 60px rgba(0,0,0,.45);color:#e5f6ff;font:13px system-ui,sans-serif;display:none'; o.innerHTML='<b>Actualizando biblioteca SD...</b><div id="libraryRefreshMsgF22" style="margin-top:6px;color:#a9c6d8">Escaneando...</div><div style="height:10px;border-radius:999px;background:rgba(255,255,255,.12);overflow:hidden;margin-top:10px"><div id="libraryRefreshBarF22" style="height:100%;width:4%;background:linear-gradient(90deg,#38bdf8,#22c55e);transition:width .18s ease"></div></div><div id="libraryRefreshTimeF22" style="margin-top:6px;color:#8fb2c8;font-size:12px">0s</div>'; document.body.appendChild(o); return o;}
   function progress(on,msg){const o=overlay(),bar=$('libraryRefreshBarF22'),m=$('libraryRefreshMsgF22'),t=$('libraryRefreshTimeF22'); if(!on){clearInterval(state.timer); if(bar)bar.style.width='100%'; if(m)m.textContent=msg||'Listo'; if(t)t.textContent='Ver consola para detalle'; setTimeout(()=>o.style.display='none',4200); return;} o.style.display='block'; let pct=4,start=Date.now(); if(bar)bar.style.width='4%'; if(m)m.textContent='Escaneando SD y reconstruyendo índice'; clearInterval(state.timer); state.timer=setInterval(()=>{pct=Math.min(94,pct+(pct<60?3:1)); if(bar)bar.style.width=pct+'%'; if(t)t.textContent='Tiempo transcurrido: '+Math.round((Date.now()-start)/1000)+'s';},650);}
-  async function load(refresh){if(refresh&&state.refreshing)return; ensureUi(); if(refresh){state.refreshing=true; progress(true); const b=$('btnLibraryRefresh'); if(b){b.disabled=true;b.textContent='⏳ Actualizando...';}} try{await refreshVisibleMask(); const p=await xhrJson(refresh?'/api/library?refresh=1':'/api/library?refresh=0'); if(p&&p.driveVisibleMask!=null)state.visibleMask=Number(p.driveVisibleMask)||state.visibleMask; let files=Array.isArray(p.files)?p.files:[]; let idx=null; if((!files.length)&&Number(p.indexCount||p.total||0)>0){idx=await readIndexFallback(p.indexCount||p.total); if(Array.isArray(idx)&&idx.length)files=idx;} else if(refresh){idx=await readIndexFallback(p.indexCount||p.total||files.length);} setFiles(files,p); await syncDriveState(); state.page=0; render(refresh?'manual-refresh':'load-index'); if(refresh){await logIndex(p,idx); const ok=Array.isArray(idx)&&idx.length===Number(p.indexCount||files.length); progress(false,'Biblioteca actualizada: '+state.files.length+' archivo(s). '+(ok?'JSON leído OK desde SD.':'Listado cargado; revisar JSON en consola.'));} return p;}catch(e){console.warn(TAG,e&&e.message?e.message:e); if(refresh){progress(false,'Error: '+(e&&e.message?e.message:e)); alert('Error actualizando biblioteca: '+(e&&e.message?e.message:e));} if(state.files.length)render('error-cache'); return null;}finally{if(refresh){state.refreshing=false; const b=$('btnLibraryRefresh'); if(b){b.disabled=false;b.textContent='🔄 Refrescar biblioteca';}}}}
+  async function load(refresh){
+    if(refresh&&state.refreshing)return;
+    ensureUi();
+    if(!refresh&&state.files.length&&Date.now()-Number(state.lastLoadAt||0)<300000){
+      syncDriveState().finally(()=>{const g=$('libraryGridF22'); if(g&&g.querySelector('.mock-lib-card'))updateVisibleCardUnits(); else render('ui-cache-fast');});
+      return state.payload;
+    }
+    if(!refresh&&!state.files.length){
+      const bc=browserCacheLoad();
+      if(bc&&Array.isArray(bc.files)&&bc.files.length){
+        state.browserCacheUsed=true;
+        setFiles(bc.files,bc.payload||{source:'browser_storage',total:bc.files.length,indexCount:bc.files.length});
+        state.lastLoadAt=Date.now();
+        render('browser-storage-cache');
+        syncDriveState().finally(()=>{const g=$('libraryGridF22'); if(g&&g.querySelector('.mock-lib-card'))updateVisibleCardUnits(); else render('browser-storage-status');});
+        return state.payload;
+      }
+    }
+    if(refresh){
+      state.refreshing=true;
+      progress(true);
+      const b=$('btnLibraryRefresh');
+      if(b){b.disabled=true;b.textContent='⏳ Actualizando...';}
+    }
+    try{
+      await refreshVisibleMask();
+      const pageSize=50;
+      const base=refresh?'/api/library?refresh=1&manual=1&commit=1':'/api/library?refresh=0';
+      const first=await xhrJson(base+'&page=0&pageSize='+pageSize);
+      if(first&&first.driveVisibleMask!=null)state.visibleMask=Number(first.driveVisibleMask)||state.visibleMask;
+      let files=Array.isArray(first.files)?first.files.slice():[];
+      const total=Number(first&&first.total||first&&first.indexCount||files.length||0);
+      let p=first;
+      // F43P: cargar la Biblioteca por páginas de 50. Evita respuestas grandes
+      // que puedan cortar chunked encoding y evita que la UI quede sin listado.
+      for(let pg=1; files.length<total && pg<80; pg++){
+        const nx=await xhrJson('/api/library?refresh=0&page='+pg+'&pageSize='+pageSize);
+        const more=Array.isArray(nx.files)?nx.files:[];
+        if(!more.length)break;
+        files=files.concat(more);
+      }
+      let idx=null;
+      if((!files.length)&&Number(first.indexCount||first.total||0)>0){
+        idx=await readIndexFallback(first.indexCount||first.total);
+        if(Array.isArray(idx)&&idx.length)files=idx;
+      } else if(refresh){
+        // En F42J el refresh normal es seguro/no commit; se valida el JSON solo como diagnóstico.
+        idx=await readIndexFallback(first.indexCount||first.total||files.length);
+      }
+      setFiles(files,first);
+      if(files.length) browserCacheSave(state.files,first);
+      state.lastLoadAt=Date.now();
+      await syncDriveState();
+      state.page=0;
+      render(refresh?'manual-refresh-safe':'load-index-paged');
+      if(refresh){
+        await logIndex(first,idx);
+        const ok=files.length===Number(first.total||first.indexCount||files.length);
+        progress(false,'Biblioteca actualizada y cacheada en navegador: '+state.files.length+' archivo(s). '+(ok?'Listado paginado OK.':'Listado cargado parcial; revisar consola.'));
+      }
+      return first;
+    }catch(e){
+      console.warn(TAG,e&&e.message?e.message:e);
+      if(refresh){
+        progress(false,'Error: '+(e&&e.message?e.message:e));
+        alert('Error actualizando biblioteca: '+(e&&e.message?e.message:e));
+      }
+      if(state.files.length)render('error-cache');
+      return null;
+    }finally{
+      if(refresh){
+        state.refreshing=false;
+        const b=$('btnLibraryRefresh');
+        if(b){b.disabled=false;b.textContent='🔄 Refrescar biblioteca';}
+      }
+    }
+  }
+  async function analyzeCas(file){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; f.pendingAnalyze=true; render('cas-analyze-start'); try{const r=await xhrJson('/api/cas/analyze?file='+enc(file)+'&force=1'); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingAnalyze=false; fx.casAnalyzed=1; fx.casProfile=String(r.profile||''); fx.casAutoProfile=String(r.profile||''); fx.casConfidence=String(r.confidence||''); fx.casEffectiveProfile=String(r.casEffectiveProfile||r.profile||fx.casEffectiveProfile||'AUTO'); fx.casOverride=Number(r.casOverride?1:0); fx.casOverrideProfile=String(r.casOverrideProfile||fx.casOverrideProfile||'AUTO'); fx.casInitialBaud=Number(r.initialBaud||0)||0; fx.casFirstDataBaud=Number(r.firstDataBaud||0)||0; fx.casTurboBaud=Number(r.turboBaud||0)||0; fx.casMaxBaud=Number(r.maxBaud||0)||0; fx.casDataBlocks=Number(r.dataBlocks||0)||0; fx.casBaudChunks=Number(r.baudChunks||0)||0; fx.casFskChunks=Number(r.fskChunks||0)||0; fx.casPwmChunks=Number(r.pwmChunks||0)||0;} try{if(typeof setStatus==='function')setStatus('CAS analizado: '+base(file)+' → '+casProfileLabel((fx&&fx.casEffectiveProfile)||r.profile),true)}catch(e){} render('cas-analyze-ok');}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.pendingAnalyze=false; render('cas-analyze-error'); alert('No se pudo analizar CAS: '+(e&&e.message?e.message:e));}}
+  async function setCasProfile(file,profile){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; const old=f.casOverride?f.casOverrideProfile:'AUTO'; f.pendingProfile=true; render('cas-profile-start'); try{const r=await xhrJson('/api/cas/profile?file='+enc(file)+'&profile='+enc(profile)); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingProfile=false; fx.casOverride=Number(r.override?1:0); fx.casOverrideProfile=String(r.overrideProfile||'AUTO'); fx.casEffectiveProfile=String(r.effectiveProfile||fx.casProfile||'AUTO');} try{if(typeof setStatus==='function')setStatus('Perfil CAS guardado: '+base(file)+' → '+casProfileLabel((fx&&fx.casEffectiveProfile)||profile),true)}catch(e){} render('cas-profile-ok');}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.pendingProfile=false; fx.casOverrideProfile=old;} render('cas-profile-error'); alert('No se pudo guardar perfil CAS: '+(e&&e.message?e.message:e));}}
   async function prepareCas(file){const f=state.files.find(x=>sameFile(x,file)); if(!f)return; f.pendingCas=true; updateVisibleCardUnits(); try{const res=await xhrJson('/cas/mount?file='+enc(file)+'&fast=1'); state.files.forEach(x=>{if(typeOf(x)==='CAS'){x.casMounted=0;x.pendingCas=false;}}); const fx=state.files.find(x=>sameFile(x,file)); if(fx){fx.casMounted=1;fx.pendingCas=false;} try{if(typeof updateCasManualPanelF49==='function')updateCasManualPanelF49(Object.assign({casMounted:1,casPlaying:0,casName:base(file),name:base(file)},res||{}));}catch(e){} try{window.casLastStatusF49J=Object.assign(window.casLastStatusF49J||{},{casMounted:1,mounted:1,casPlaying:0,playing:0,casName:base(file),name:base(file)});}catch(e){} try{if(typeof setStatus==='function')setStatus('C: preparado: '+base(file),true);}catch(e){} updateVisibleCardUnits();}catch(e){const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.pendingCas=false; updateVisibleCardUnits(); alert('No se pudo preparar el cassette: '+(e&&e.message?e.message:e));}}
+  function ensureBrowserCacheButton(){try{const row=document.querySelector('#atrLibraryPageBlock .library-refresh-row'); if(!row||$('btnLibraryBrowserCacheClearF43M'))return; const b=document.createElement('button'); b.id='btnLibraryBrowserCacheClearF43M'; b.type='button'; b.className='secondary'; b.textContent='Limpiar cache listado'; b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();browserCacheClear(); state.files=[]; state.lastLoadAt=0; render('browser-cache-cleared'); try{if(typeof setStatus==='function')setStatus('Cache del navegador de Biblioteca limpiada',true);}catch(e){}; return false;},true); row.appendChild(b);}catch(e){}}
   async function mountFile(file,unit){const bit=1<<(Number(unit)-1); const f=state.files.find(x=>sameFile(x,file)); if(f){f.pendingMount=unit; updateVisibleCardUnits();} try{await syncDriveState(); const curMask=Number(state.statusMask||0)||0; const curForce=Number(state.statusForceMask||0)||0; const params=new URLSearchParams(); params.set('en','1'); params.set('mask',String(curMask|bit)); params.set('force',String(curForce|bit)); params.set('unit',String(unit)); params.set('file',String(file||'')); params.set('reply','light'); const a=await xhrJson('/set_webatr?'+params.toString()); if(!syncFromAtrStatus(a)){state.files.forEach(x=>{x.pendingMount=0; if(MOUNT_TYPES.includes(typeOf(x)))x.mountedMask=Number(x.mountedMask||0)&(~bit);}); const fx=state.files.find(x=>sameFile(x,file)); if(fx)fx.mountedMask=Number(fx.mountedMask||0)|bit; state.statusMask=curMask|bit; state.statusForceMask=curForce|bit;} try{window.lastAtrStatus=Object.assign(window.lastAtrStatus||{},a||{});}catch(e){} try{if(typeof atrApplyLightStatusFast==='function')atrApplyLightStatusFast(a,{forceCovers:false});}catch(e){} try{if(typeof atrSetAutoSaveState==='function')atrSetAutoSaveState('Guardado','ok');}catch(e){} try{if(typeof setStatus==='function')setStatus('Montado en D'+unit+': '+base(file),true);}catch(e){} updateVisibleCardUnits();}catch(e){state.files.forEach(x=>x.pendingMount=0); updateVisibleCardUnits(); alert('No se pudo montar D'+unit+': '+(e&&e.message?e.message:e));}}
-  function bind(){ensureUi(); const old=$('btnLibraryRefresh'); if(old&&!old.dataset.f22Ready){const b=old.cloneNode(true); b.dataset.f22Ready='1'; b.textContent='🔄 Refrescar biblioteca'; old.replaceWith(b); b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();load(true);return false;},true);} const s=$('atrLibrarySearch'); if(s&&!s.dataset.f22Ready){s.dataset.f22Ready='1'; s.addEventListener('input',ev=>{ev.stopPropagation();state.query=s.value||'';state.page=0;render('search');},true);} const sort=$('atrLibrarySortF22'); if(sort&&!sort.dataset.f22Ready){sort.dataset.f22Ready='1'; sort.addEventListener('change',ev=>{ev.stopPropagation();state.sort=sort.value||'name';state.page=0;render('sort');},true);} ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el&&!el.dataset.f22Default){el.dataset.f22Default='1'; el.value='all'; el.addEventListener('change',()=>{try{localStorage.setItem('atrCoverModeV29Fix3',el.value);localStorage.setItem('atrCoverModeV29',el.value);}catch(e){}},true);}});}
-  document.addEventListener('click',ev=>{const t=ev.target&&ev.target.closest?ev.target.closest('[data-f22-cover],[data-f22-filter],#btnLibraryPrevF22,#btnLibraryNextF22,[data-f22-action]'):null; if(!t)return; ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); if(t.dataset.f22Cover){try{atrOpenCoverFullscreen(t.dataset.full||t.src,t.dataset.title||'')}catch(e){} return false;} if(t.dataset.f22Filter){state.type=String(t.dataset.f22Filter||'ALL').toUpperCase(); if(!TYPES.includes(state.type))state.type='ALL'; state.page=0; render('filter'); return false;} if(t.id==='btnLibraryPrevF22'){state.page=Math.max(0,state.page-1);render('prev');return false;} if(t.id==='btnLibraryNextF22'){state.page++;render('next');return false;} const act=t.dataset.f22Action,file=t.dataset.file||''; if(act==='cas'){prepareCas(file);return false;} if(act==='mount'){mountFile(file,Number(t.dataset.unit||1));return false;} if(act==='delete'){if(confirm('¿Eliminar '+file+'?')){if(typeof deleteAtr==='function')deleteAtr(enc(file)); else xhrJson('/atr/delete?file='+enc(file)).then(()=>load(false));}return false;}},true);
-  document.addEventListener('change',ev=>{const t=ev.target; if(t&&t.id==='atrLibraryPageSizeF22'){ev.preventDefault();ev.stopPropagation();state.pageSize=Number(t.value||24)||24;state.page=0;render('page-size');}},true);
+  function bind(){ensureUi(); ensureBrowserCacheButton(); const old=$('btnLibraryRefresh'); if(old&&!old.dataset.f22Ready){const b=old.cloneNode(true); b.dataset.f22Ready='1'; b.textContent='🔄 Refrescar biblioteca'; old.replaceWith(b); b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();load(true);return false;},true);} const s=$('atrLibrarySearch'); if(s&&!s.dataset.f22Ready){s.dataset.f22Ready='1'; s.addEventListener('input',ev=>{ev.stopPropagation();state.query=s.value||'';state.page=0;render('search');},true);} const sort=$('atrLibrarySortF22'); if(sort&&!sort.dataset.f22Ready){sort.dataset.f22Ready='1'; sort.addEventListener('change',ev=>{ev.stopPropagation();state.sort=sort.value||'name';state.page=0;render('sort');},true);} ['atrCoverMode','atrCoverModeAtr'].forEach(id=>{const el=$(id); if(el&&!el.dataset.f22Default){el.dataset.f22Default='1'; el.value=coverMode(); el.addEventListener('change',()=>{try{localStorage.setItem('atrCoverModeV29Fix3',el.value);localStorage.setItem('atrCoverModeV29',el.value);document.body.classList.toggle('cover-mode-off',el.value==='off');['atrCoverPerfState','atrCoverPerfStateAtr'].forEach(pid=>{const pe=$(pid); if(pe)pe.textContent=(el.value==='off'?'Imágenes apagadas':(el.value==='manual'?'Manual':'Solo visibles'));}); if(el.value!=='off'&&el.value!=='manual')loadCovers();}catch(e){}},true);}}); ['btnLoadVisibleCovers','btnLoadVisibleCoversAtr'].forEach(id=>{const b=$(id); if(b&&!b.dataset.f43Ready){b.dataset.f43Ready='1'; b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();localStorage.setItem('atrCoverModeV29Fix3','visible');localStorage.setItem('atrCoverModeV29','visible');setCoverDefaultAll(); const grid=$('libraryGridF22'); if(grid)Array.from(grid.querySelectorAll('img.f22-lazy-cover[data-src]:not([data-loaded="1"]):not([data-error="1"])')).slice(0,4).forEach(queueCover); return false;},true);}}); ['btnRefreshCoverImages','btnRefreshCoverImagesAtr'].forEach(id=>{const b=$(id); if(b&&!b.dataset.f43qReady){b.dataset.f43qReady='1'; b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation(); const txt=b.textContent; b.disabled=true; b.textContent='⏳ Actualizando imágenes...'; try{refreshCoverImages();}finally{setTimeout(()=>{b.disabled=false;b.textContent=txt||'🔄 Actualizar imágenes';},900);} return false;},true);}});}
+  document.addEventListener('click',ev=>{const t=ev.target&&ev.target.closest?ev.target.closest('[data-f22-cover],[data-f22-filter],#btnLibraryPrevF22,#btnLibraryNextF22,[data-f22-action]'):null; if(!t)return; ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); if(t.dataset.f22Cover){try{atrOpenCoverFullscreen(t.dataset.full||t.src,t.dataset.title||'')}catch(e){} return false;} if(t.dataset.f22Filter){state.type=String(t.dataset.f22Filter||'ALL').toUpperCase(); if(!TYPES.includes(state.type))state.type='ALL'; state.page=0; render('filter'); return false;} if(t.id==='btnLibraryPrevF22'){state.page=Math.max(0,state.page-1);render('prev');return false;} if(t.id==='btnLibraryNextF22'){state.page++;render('next');return false;} const act=t.dataset.f22Action,file=t.dataset.file||''; if(act==='cas-analyze'){analyzeCas(file);return false;} if(act==='cas'){prepareCas(file);return false;} if(act==='mount'){mountFile(file,Number(t.dataset.unit||1));return false;} if(act==='delete'){if(confirm('¿Eliminar '+file+'?')){if(typeof deleteAtr==='function')deleteAtr(enc(file)); else xhrJson('/atr/delete?file='+enc(file)).then(()=>load(false));}return false;}},true);
+  document.addEventListener('change',ev=>{const t=ev.target; if(t&&t.dataset&&t.dataset.f22ProfileFile){ev.preventDefault();ev.stopPropagation();setCasProfile(t.dataset.f22ProfileFile,t.value||'AUTO');return false;} if(t&&t.id==='atrLibraryPageSizeF22'){ev.preventDefault();ev.stopPropagation();state.pageSize=Number(t.value||24)||24;state.page=0;render('page-size');}},true);
   window.renderAtrLibrary=function(files){if(Array.isArray(files)&&files.length){setFiles(files,state.payload);syncDriveState().finally(()=>render('external-nonempty'));}else if(state.files.length&&isLibrary())render('external-empty-guard');}; try{renderAtrLibrary=window.renderAtrLibrary;}catch(e){}
-  const oldApply=window.atrApplyLightStatusFast; if(typeof oldApply==='function'&&!oldApply.__f22Wrapped){window.atrApplyLightStatusFast=function(st,opts){const r=oldApply.apply(this,arguments); try{if(syncFromAtrStatus(st)&&state.files.length){updateVisibleCardUnits(); if(isLibrary())render('status-sync');}}catch(e){} return r;}; window.atrApplyLightStatusFast.__f22Wrapped=1; try{atrApplyLightStatusFast=window.atrApplyLightStatusFast;}catch(e){}}
+  const oldApply=window.atrApplyLightStatusFast; if(typeof oldApply==='function'&&!oldApply.__f22Wrapped){window.atrApplyLightStatusFast=function(st,opts){const r=oldApply.apply(this,arguments); try{if(syncFromAtrStatus(st)&&state.files.length){updateVisibleCardUnits(); /* F43S: sin render completo para no recargar covers */}}catch(e){} return r;}; window.atrApplyLightStatusFast.__f22Wrapped=1; try{atrApplyLightStatusFast=window.atrApplyLightStatusFast;}catch(e){}}
   window.loadLibraryPageF22=function(opts){opts=opts||{}; bind(); return load(!!opts.refresh);}; window.loadLibraryPageF21=window.loadLibraryPageF22; window.loadLibraryPageF20=window.loadLibraryPageF22; window.loadLibraryPageF19=window.loadLibraryPageF22; window.loadLibraryPageF18=window.loadLibraryPageF22; window.loadLibraryPageF16=window.loadLibraryPageF22; window.loadLibraryPageF14=window.loadLibraryPageF22; window.loadLibraryPageF49Z83=window.loadLibraryPageF22; window.loadLibraryPageF49Z45=window.loadLibraryPageF22; window.loadLibraryPageF49Z47=window.loadLibraryPageF22;
   try{window.atrLibraryCurrentFilesF27=function(){return state.files.slice();};}catch(e){}
   const oldNav=window.navigateInternalF49Z51; if(typeof oldNav==='function'&&!oldNav.__f22){window.navigateInternalF49Z51=function(){const r=oldNav.apply(this,arguments); setTimeout(()=>{bind(); if(isLibrary())load(false); if(isAtr())load(false).then(populateWebAtr);},220); return r;}; window.navigateInternalF49Z51.__f22=1;}
   window.addEventListener('popstate',()=>setTimeout(()=>{bind(); if(isLibrary())load(false); if(isAtr())load(false).then(populateWebAtr);},220));
-  window.addEventListener('focus',()=>{if(isLibrary()&&state.files.length)syncDriveState().then(()=>render('focus-sync'));});
+  window.addEventListener('focus',()=>{if(isLibrary()&&state.files.length)syncDriveState().then(()=>{const g=$('libraryGridF22'); if(g&&g.querySelector('.mock-lib-card'))updateVisibleCardUnits(); else render('focus-sync');});});
   function boot(){bind(); setCoverDefaultAll(); if(isLibrary())load(false); if(isAtr())load(false).then(populateWebAtr); const block=$('atrLibraryPageBlock'); if(block&&window.MutationObserver){const mo=new MutationObserver(()=>{if(isLibrary()&&state.files.length){const g=$('libraryGridF22'); if(g&&!g.querySelector('.mock-lib-card'))setTimeout(()=>render('observer-restore'),40);}}); mo.observe(block,{childList:true,subtree:true});}}
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot); else boot();
 })();
 
 
 
-(function(){try{console.info('F42L_LIBRARY_HTTP_NO_CONTENT_LENGTH_FIX activo · no debe aparecer Biblioteca F49Z47_TIMEOUT.');}catch(e){}})();
+(function(){
+  try{console.info('F43S: Biblioteca actualiza estado de montaje por DOM parcial; evita innerHTML completo y recarga de covers.');}catch(e){}
+})();
+
+
+
+(function(){try{console.info('F43S_LIBRARY_NO_BLINK_MOUNT activo · monta/prepara sin reconstruir cards ni recargar imágenes.');}catch(e){}})();
+
+
+
+(function(){try{console.info('F43U_LIBRARY_IMAGE_DOT_MENU activo · acciones de imagen por card con botón punto y menú desplegable.');}catch(e){}})();

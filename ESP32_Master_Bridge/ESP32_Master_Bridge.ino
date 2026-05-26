@@ -1,8 +1,8 @@
 // ================================================================
 // ATARI_XF551_RP - ESP32 MASTER
-// BUILD: F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX_2026-05-22_1228
-// DATE : 2026-05-22
-// TIME : 10:18
+// BUILD: F43Y_LIBRARY_DOT_MENU_CENTER_CARD_2026-05-25_2055
+// DATE : 2026-05-25
+// TIME : 18:45
 // ARCHIVO: ESP32_Master_Bridge.ino
 //
 // CAMBIOS VIGENTES:
@@ -40,6 +40,18 @@
 // - F43F: acelera Biblioteca usando fileSize del escaneo, evita abrir cada ATR al listar y difiere covers.
 // - F43G: TNFS streaming cierra NDJSON correctamente y agrega fallback para XEX sin evento final.
 // - F43H: restaura montaje Web-ATR para XEX/COM/EXE aunque el payload rápido no incluya sectorSize/totalSectors.
+// - F43I: lectura/listado/escritura Biblioteca cerrados: solo botón manual escanea; commit guarda y devuelve files visibles.
+// - F43J: índice persistente NDJSON en /CONFIG/library_index.ndjson; lectura línea a línea sin JSON gigante en RAM.
+// - F43L: corrige orden de constantes WEB_LIBRARY_INDEX_* en respuesta streaming para compilar en Arduino.
+// - F43K: respuestas grandes files[] se envían por streaming seguro; evita String gigante y coma final },]}.
+// - F43M: agrega cache de listado en navegador y mejora carga diferida/persistente de carátulas.
+// - F43N: refresh=0 lee primero /CONFIG/library_index.ndjson; RAM/live cache queda solo como fallback sin escaneo.
+// - F43P: Biblioteca usa paginación HTTP segura de 50, sin límite total de archivos y sin fallback legacy JSON.
+// - F43Q: agrega botón Actualizar imágenes en Biblioteca; limpia cache local/missing y recarga carátulas visibles.
+// - F43R: restaura acciones de imagen por card en Biblioteca: Agregar URL, Subir imagen, Abrir Libretro, Guardar proxy SD y Quitar manual.
+// - F43S: al montar ATR o preparar C: la Biblioteca actualiza solo la card/estado; no reconstruye la grilla ni recarga imágenes.
+// - F43T: acciones de imagen por card vuelven a combobox: URL, subir, Libretro, proxy SD y quitar manual.
+// - F43U: acciones de imagen por card vuelven al botón compacto "." con menú desplegable.
 // ================================================================
 
 #include <Arduino.h>
@@ -204,7 +216,7 @@ static WebStorageAdapter WebStorage;
 
 Preferences prefs;
 
-static const char MASTER_BUILD[] = "F43H_XEX_WEBATR_MOUNTABLE_RESTORE_FIX_2026-05-22_1228";
+static const char MASTER_BUILD[] = "F43Y_LIBRARY_DOT_MENU_CENTER_CARD_2026-05-25_2055";
 
 // ===== Debug =====
 #define MASTER_UART_BYTE_DEBUG 0   // 1 = logea cada byte UART (NO recomendado)
@@ -9941,7 +9953,8 @@ static uint32_t g_webLibraryPageCacheScanMs = 0;
 static const uint32_t WEB_LIBRARY_PAGE_CACHE_TTL_MS = 60000;
 // F43E: límite máximo de objetos devueltos en UNA respuesta HTTP de Biblioteca.
 // Esto NO limita el escaneo ni el total encontrado en SD; solo evita respuestas gigantes.
-static const int WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX = 500;
+static const int WEB_LIBRARY_SAFE_HTTP_PAGE_SIZE = 50;
+static const int WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX = WEB_LIBRARY_SAFE_HTTP_PAGE_SIZE;
 
 static void webLibraryLiveScanCacheInvalidate(const char* reason) {
   g_webLibraryLiveScanCache.clear();
@@ -10211,6 +10224,115 @@ static bool webLibraryBuildLiveVisiblePage(int page, int pageSize, const String&
        (unsigned)(cacheHit ? 1 : 0), (unsigned long)cacheAgeMs,
        (unsigned long)entries.size(), (unsigned long)totalMatches, page, pageSize,
        (unsigned)pageEntries.length(), (unsigned long)scanMs, (unsigned long)cacheBuildMs, (unsigned)(full ? 1 : 0));
+
+  return true;
+}
+
+// F43K/F43P: enviar /api/library por streaming y mantener páginas HTTP chicas.
+// Evita construir un String gigante con files[]; en F43J con pageSize alto podía
+// fragmentarse y terminar en JSON inválido: },]} o en objetos truncados.
+static bool webLibraryStreamApiResponseFromEntries(const std::vector<WebLibraryScanEntry>& entries,
+                                                   const String& source,
+                                                   bool okFlag,
+                                                   bool refreshed,
+                                                   bool manualRefreshFlag,
+                                                   bool indexCommitFlag,
+                                                   bool ndjsonFlag,
+                                                   bool commitReturnedFilesFlag,
+                                                   int page,
+                                                   int pageSize,
+                                                   const String& qLower,
+                                                   const String& typeUpper,
+                                                   uint32_t indexBuildMs,
+                                                   const String& extraError = String("")) {
+  if (page < 0) page = 0;
+  if (pageSize <= 0) pageSize = 50;
+  if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+
+  uint32_t all = 0, atr = 0, xex = 0, com = 0, exe = 0, bas = 0, cas = 0, sec = 0, other = 0;
+  uint32_t totalMatches = 0;
+  for (const WebLibraryScanEntry& entry : entries) {
+    String type = webAtrStoredTypeForName(entry.name);
+    if (webLibraryEntryMatchesLiveSearchOnly(entry, qLower)) {
+      all++;
+      if (type == "ATR") atr++;
+      else if (type == "XEX") xex++;
+      else if (type == "COM") com++;
+      else if (type == "EXE") exe++;
+      else if (type == "BAS") bas++;
+      else if (type == "CAS") cas++;
+      else if (type == "SEC") sec++;
+      else other++;
+    }
+    if (webLibraryEntryMatchesLive(entry, qLower, typeUpper)) totalMatches++;
+    if ((all & 0x1F) == 0) yield();
+  }
+
+  String head;
+  head.reserve(4096);
+  head = "{\"ok\":" + String(okFlag ? "true" : "false");
+  head += ",\"source\":\"" + jsonEscape(source) + "\"";
+  head += ",\"refreshed\":" + String(refreshed ? "true" : "false");
+  head += ",\"manualRefresh\":" + String(manualRefreshFlag ? "true" : "false");
+  head += ",\"indexCommit\":" + String(indexCommitFlag ? "true" : "false");
+  head += ",\"ndjson\":" + String(ndjsonFlag ? "true" : "false");
+  head += ",\"autoScanDisabled\":true";
+  if (indexCommitFlag) head += ",\"commitReturnedFiles\":" + String(commitReturnedFilesFlag ? "true" : "false");
+  head += ",\"streamedFiles\":true";
+  head += ",\"indexPath\":\"" + jsonEscape(String("/CONFIG/library_index.ndjson")) + "\"";
+  head += ",\"legacyJsonPathDisabled\":\"/CONFIG/library_index.json\"";
+  head += ",\"indexCount\":" + String((unsigned)entries.size());
+  head += ",\"indexBuildMs\":" + String(indexBuildMs);
+  head += ",\"indexLoadMs\":0";
+  if (extraError.length()) head += ",\"streamError\":\"" + jsonEscape(extraError) + "\"";
+  webLibraryAppendSaveStatusJson(head);
+  head += ",\"page\":" + String(page);
+  head += ",\"pageSize\":" + String(pageSize);
+  head += ",\"total\":" + String(totalMatches);
+  head += ",\"typeCounts\":{";
+  head += "\"ALL\":" + String(all);
+  head += ",\"ATR\":" + String(atr);
+  head += ",\"XEX\":" + String(xex);
+  head += ",\"COM\":" + String(com);
+  head += ",\"EXE\":" + String(exe);
+  head += ",\"BAS\":" + String(bas);
+  head += ",\"CAS\":" + String(cas);
+  head += ",\"SEC\":" + String(sec);
+  head += ",\"OTHER\":" + String(other);
+  head += "},\"files\":[";
+
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent(head);
+
+  uint32_t startWanted = (uint32_t)page * (uint32_t)pageSize;
+  uint32_t seenMatches = 0;
+  uint32_t added = 0;
+  bool first = true;
+  for (const WebLibraryScanEntry& entry : entries) {
+    if (webLibraryEntryMatchesLive(entry, qLower, typeUpper)) {
+      if (seenMatches >= startWanted && added < (uint32_t)pageSize) {
+        if (!first) server.sendContent(",");
+        String obj;
+        obj.reserve(768);
+        webLibraryAppendScanEntryJson(obj, entry);
+        server.sendContent(obj);
+        first = false;
+        added++;
+        if ((added & 0x07) == 0) yield();
+      }
+      seenMatches++;
+    }
+  }
+  server.sendContent("]}");
+  server.sendContent("");
+  logf("[LIB-IDX] F43K streamed library response source=%s entries=%lu total=%lu page=%d pageSize=%d sent=%lu buildMs=%lu",
+       source.c_str(), (unsigned long)entries.size(), (unsigned long)totalMatches,
+       page, pageSize, (unsigned long)added, (unsigned long)indexBuildMs);
   return true;
 }
 
@@ -10308,6 +10430,12 @@ static const char WEB_LIBRARY_INDEX_PATH[] = "/CONFIG/library_index.json";
 static const char WEB_LIBRARY_INDEX_BAK_PATH[] = "/CONFIG/library_index.bak.json";
 static const char WEB_LIBRARY_INDEX_TMP_PATH[] = "/CONFIG/library_index.tmp";
 static const char WEB_LIBRARY_INDEX_PREV_PATH[] = "/CONFIG/library_index.prev.json";
+// F43J: índice persistente en NDJSON. Cada línea es un objeto JSON independiente.
+// Esto evita cargar un JSON gigante completo a RAM y elimina problemas de coma final/len=0.
+static const char WEB_LIBRARY_INDEX_NDJSON_PATH[] = "/CONFIG/library_index.ndjson";
+static const char WEB_LIBRARY_INDEX_NDJSON_BAK_PATH[] = "/CONFIG/library_index.bak.ndjson";
+static const char WEB_LIBRARY_INDEX_NDJSON_TMP_PATH[] = "/CONFIG/library_index.tmp.ndjson";
+static const char WEB_LIBRARY_INDEX_NDJSON_PREV_PATH[] = "/CONFIG/library_index.prev.ndjson";
 static String   g_webLibraryIndexJson;
 static bool     g_webLibraryIndexLoaded = false;
 static bool     g_webLibraryIndexDirty = false;
@@ -11053,6 +11181,271 @@ static bool webLibraryObjectMatches(const String& obj, const String& qLower, con
     if (type != typeUpper) return false;
   }
   return true;
+}
+
+
+// F43J: guardar índice en NDJSON, una entrada por línea.
+// No se usa un array JSON gigante ni se carga el archivo completo a RAM.
+static bool webLibraryNdjsonVerifyFileAt(const char* path, uint32_t expectedCount, uint32_t expectedBytes,
+                                         uint32_t& verifyCount, uint32_t& fileBytes) {
+  verifyCount = 0;
+  fileBytes = 0;
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  fileBytes = (uint32_t)f.size();
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    if (line.startsWith("{") && line.endsWith("}") && line.indexOf("\"name\"") >= 0 && line.indexOf("\"path\"") >= 0) verifyCount++;
+    yield();
+  }
+  f.close();
+  bool countOk = (expectedCount == 0) || (verifyCount == expectedCount);
+  bool bytesOk = (expectedBytes == 0) || (fileBytes == expectedBytes);
+  return countOk && bytesOk && verifyCount > 0;
+}
+
+static bool webLibraryNdjsonCopyFile(const char* from, const char* to) {
+  if (!webAtrFsReady() || !SPIFFS.exists(from)) return false;
+  File src = SPIFFS.open(from, "r");
+  if (!src) return false;
+  if (SPIFFS.exists(to)) SPIFFS.remove(to);
+  File dst = SPIFFS.open(to, "w");
+  if (!dst) { src.close(); return false; }
+  uint8_t buf[512];
+  bool ok = true;
+  while (src.available()) {
+    int n = src.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    if (dst.write(buf, n) != (size_t)n) { ok = false; break; }
+    yield();
+  }
+  src.close();
+  dst.flush();
+  dst.close();
+  if (!ok && SPIFFS.exists(to)) SPIFFS.remove(to);
+  return ok;
+}
+
+static bool webLibraryNdjsonSaveFromEntries(const std::vector<WebLibraryScanEntry>& entries) {
+  uint32_t t0 = millis();
+  g_webLibraryIndexLastSaveOk = false;
+  g_webLibraryIndexLastVerifyOk = false;
+  g_webLibraryIndexLastSavedBytes = 0;
+  g_webLibraryIndexLastVerifyCount = 0;
+  g_webLibraryIndexLastSaveError = "";
+
+  if (!webLibraryEnsureConfigDir()) {
+    g_webLibraryIndexLastSaveError = "No se pudo crear/acceder /CONFIG para NDJSON";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+  if (entries.empty()) {
+    g_webLibraryIndexLastSaveError = "Protegido: no se escribe índice NDJSON vacío";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
+  File f = SPIFFS.open(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, "w");
+  if (!f) {
+    g_webLibraryIndexLastSaveError = "No se pudo abrir library_index.tmp.ndjson";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  uint32_t written = 0;
+  uint32_t count = 0;
+  bool ok = true;
+  for (const WebLibraryScanEntry& entry : entries) {
+    String obj;
+    obj.reserve(768);
+    webLibraryAppendScanEntryJson(obj, entry);
+    size_t w1 = f.print(obj);
+    size_t w2 = f.print('\n');
+    written += (uint32_t)(w1 + w2);
+    if (w1 != obj.length() || w2 != 1) { ok = false; break; }
+    count++;
+    if ((count & 0x0F) == 0) yield();
+  }
+  f.flush();
+  f.close();
+
+  g_webLibraryIndexLastSavedBytes = written;
+  if (!ok || count != entries.size()) {
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
+    g_webLibraryIndexLastSaveError = String("Escritura NDJSON incompleta count=") + String(count) + " expected=" + String((unsigned)entries.size());
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  uint32_t verifyCount = 0;
+  uint32_t fileBytes = 0;
+  bool tmpOk = webLibraryNdjsonVerifyFileAt(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, count, written, verifyCount, fileBytes);
+  if (!tmpOk) {
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
+    g_webLibraryIndexLastVerifyCount = verifyCount;
+    g_webLibraryIndexLastSaveError = String("TMP NDJSON inválido count=") + String(verifyCount) + " expected=" + String(count) +
+      " bytes=" + String(fileBytes) + "/" + String(written);
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PATH)) {
+    if (!SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) {
+      webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
+      SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PATH);
+    }
+  }
+
+  bool promoted = SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
+  if (!promoted) promoted = webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
+
+  uint32_t finalCount = 0;
+  uint32_t finalBytes = 0;
+  bool finalOk = promoted && webLibraryNdjsonVerifyFileAt(WEB_LIBRARY_INDEX_NDJSON_PATH, count, written, finalCount, finalBytes);
+  if (!finalOk) {
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PATH);
+    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
+    g_webLibraryIndexLastVerifyCount = finalCount;
+    g_webLibraryIndexLastSaveError = String("Promoción NDJSON fallida count=") + String(finalCount) + " expected=" + String(count) +
+      " bytes=" + String(finalBytes) + "/" + String(written);
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
+  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
+  webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH);
+
+  g_webLibraryIndexLastVerifyCount = finalCount;
+  g_webLibraryIndexLastVerifyOk = true;
+  g_webLibraryIndexLastSaveOk = true;
+  g_webLibraryIndexLastSaveMs = millis() - t0;
+  g_webLibraryIndexLastSaveError = "";
+  g_webLibraryIndexCount = count;
+  logf("[LIB-NDJSON] save ok=1 bytes=%lu count=%lu ms=%lu path=%s",
+       (unsigned long)finalBytes, (unsigned long)finalCount, (unsigned long)g_webLibraryIndexLastSaveMs,
+       WEB_LIBRARY_INDEX_NDJSON_PATH);
+  return true;
+}
+
+static bool webLibraryNdjsonPageFromPath(const char* path, int page, int pageSize, const String& qLower, const String& typeUpper,
+                                         String& pageEntries, uint32_t& totalMatches,
+                                         uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
+                                         uint32_t& fileBytesOut) {
+  pageEntries = "";
+  totalMatches = 0;
+  all = atr = xex = com = exe = bas = cas = sec = other = 0;
+  fileBytesOut = 0;
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  fileBytesOut = (uint32_t)f.size();
+  if (page < 0) page = 0;
+  if (pageSize <= 0) pageSize = 50;
+  if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+  uint32_t startWanted = (uint32_t)page * (uint32_t)pageSize;
+  uint32_t added = 0;
+  pageEntries.reserve(pageSize <= 50 ? 16384 : (pageSize <= 100 ? 32768 : 49152));
+
+  while (f.available()) {
+    String obj = f.readStringUntil('\n');
+    obj.trim();
+    if (!obj.length()) continue;
+    if (!obj.startsWith("{") || !obj.endsWith("}")) continue;
+
+    if (webLibraryObjectMatchesSearchOnly(obj, qLower)) {
+      all++;
+      String tt = webLibraryTypeFromObject(obj);
+      if (tt == "ATR") atr++;
+      else if (tt == "XEX") xex++;
+      else if (tt == "COM") com++;
+      else if (tt == "EXE") exe++;
+      else if (tt == "BAS") bas++;
+      else if (tt == "CAS") cas++;
+      else if (tt == "SEC") sec++;
+      else other++;
+    }
+
+    if (webLibraryObjectMatches(obj, qLower, typeUpper)) {
+      if (totalMatches >= startWanted && added < (uint32_t)pageSize) {
+        if (pageEntries.length()) pageEntries += ",";
+        pageEntries += obj;
+        added++;
+      }
+      totalMatches++;
+    }
+    if ((all & 0x0F) == 0) yield();
+  }
+  f.close();
+  bool ok = (all > 0) || qLower.length() || (typeUpper.length() && typeUpper != "ALL");
+  logf("[LIB-NDJSON] read page path=%s ok=%u bytes=%lu all=%lu total=%lu page=%d pageSize=%d pageBytes=%u",
+       path, (unsigned)(ok ? 1 : 0), (unsigned long)fileBytesOut, (unsigned long)all, (unsigned long)totalMatches,
+       page, pageSize, (unsigned)pageEntries.length());
+  return ok;
+}
+
+static bool webLibraryNdjsonBestPage(int page, int pageSize, const String& qLower, const String& typeUpper,
+                                     String& pageEntries, uint32_t& totalMatches,
+                                     uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
+                                     String& sourceOut, uint32_t& fileBytesOut) {
+  const char* paths[] = { WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH };
+  const char* names[] = { "ndjson", "ndjson_bak", "ndjson_prev" };
+  for (int i = 0; i < 3; i++) {
+    if (webLibraryNdjsonPageFromPath(paths[i], page, pageSize, qLower, typeUpper, pageEntries, totalMatches,
+                                     all, atr, xex, com, exe, bas, cas, sec, other, fileBytesOut)) {
+      sourceOut = names[i];
+      return true;
+    }
+  }
+  sourceOut = "";
+  fileBytesOut = 0;
+  return false;
+}
+
+static bool webLibraryNdjsonReadAllEntries(String& entries, uint32_t& count, String& sourceOut, uint32_t& fileBytesOut) {
+  entries = "";
+  count = 0;
+  sourceOut = "";
+  fileBytesOut = 0;
+  if (!webAtrFsReady()) return false;
+  const char* paths[] = { WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH };
+  const char* names[] = { "ndjson", "ndjson_bak", "ndjson_prev" };
+  for (int i = 0; i < 3; i++) {
+    const char* path = paths[i];
+    if (!SPIFFS.exists(path)) continue;
+    File f = SPIFFS.open(path, "r");
+    if (!f) continue;
+    entries = "";
+    count = 0;
+    fileBytesOut = (uint32_t)f.size();
+    entries.reserve(fileBytesOut > 0 ? (fileBytesOut + 8) : 4096);
+    while (f.available()) {
+      String obj = f.readStringUntil('\n');
+      obj.trim();
+      if (!obj.length()) continue;
+      if (!obj.startsWith("{") || !obj.endsWith("}")) continue;
+      if (entries.length()) entries += ",";
+      entries += obj;
+      count++;
+      if ((count & 0x0F) == 0) yield();
+    }
+    f.close();
+    if (count > 0) {
+      sourceOut = names[i];
+      logf("[LIB-NDJSON] read all path=%s ok=1 bytes=%lu count=%lu pageBytes=%u",
+           path, (unsigned long)fileBytesOut, (unsigned long)count, (unsigned)entries.length());
+      return true;
+    }
+  }
+  entries = "";
+  count = 0;
+  fileBytesOut = 0;
+  return false;
 }
 
 
@@ -14821,8 +15214,9 @@ static void webLibraryAppendSaveStatusJson(String& json) {
 }
 
 void handleApiLibraryIndexJson() {
-  // F42B: devuelve SIEMPRE un array JSON válido. Si /CONFIG/library_index.json
-  // viene con coma final heredada de versiones anteriores, se sanea al vuelo.
+  // F43P: endpoint legacy mantenido solo por compatibilidad.
+  // Ya no lee /CONFIG/library_index.json ni .bak.json porque esos archivos viejos
+  // pueden estar truncados/inválidos. La fuente persistente real es NDJSON.
   if (!webAtrFsReady()) {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", "[]");
@@ -14830,13 +15224,10 @@ void handleApiLibraryIndexJson() {
   }
 
   String entries;
-  uint32_t count = 0;
+  uint32_t total = 0;
   String source;
-  bool ok = webLibraryIndexLoadBestFromFs(entries, count, &source);
-  if (ok && source != "main" && source != "ram" && count > 0 && webLibraryEnsureConfigDir()) {
-    const char* src = (source == "bak") ? WEB_LIBRARY_INDEX_BAK_PATH : ((source == "prev") ? WEB_LIBRARY_INDEX_PREV_PATH : nullptr);
-    if (src) webLibraryIndexCopyFile(src, WEB_LIBRARY_INDEX_PATH);
-  }
+  uint32_t bytes = 0;
+  bool ok = webLibraryNdjsonReadAllEntries(entries, total, source, bytes);
 
   String out;
   if (ok) {
@@ -14902,19 +15293,96 @@ void handleApiLibrary() {
     logf("[LIB-IDX] refresh ignorado por no venir con manual=1; usando indice existente");
   }
 
+  // F43I: el botón Refrescar Biblioteca sin commit es la única ruta de
+  // escaneo manual sin escritura. Debe escanear, poblar cache RAM y devolver
+  // files[] visibles. No toca /CONFIG/library_index.json y no cae en el flujo
+  // F43K: refresh manual sin commit escanea únicamente porque viene del botón,
+  // actualiza cache RAM y responde files[] por streaming seguro.
+  if (manualRefresh && !commitRefresh) {
+    webLibraryLiveScanCacheInvalidate("manual refresh button ndjson stream");
+
+    int rPageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 50);
+    if (rPageSize <= 0) rPageSize = 50;
+    if (rPageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) rPageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+    int rPage = server.hasArg("page") ? server.arg("page").toInt() : 0;
+    if (server.hasArg("offset")) rPage = server.arg("offset").toInt() / rPageSize;
+    if (rPage < 0) rPage = 0;
+    String rQ = server.hasArg("q") ? server.arg("q") : String(""); rQ.toLowerCase();
+    String rType = server.hasArg("type") ? server.arg("type") : String(""); rType.toUpperCase();
+
+    std::vector<WebLibraryScanEntry> liveEntries;
+    bool cacheHit = false;
+    uint32_t cacheAge = 0;
+    uint32_t buildMs = 0;
+    bool scanOk = webLibraryLiveScanCacheGet(liveEntries, true, cacheHit, cacheAge, buildMs);
+
+    g_webLibraryIndexCount = liveEntries.size();
+    g_webLibraryIndexBuildMs = buildMs;
+    g_webLibraryIndexLastSaveOk = false;
+    g_webLibraryIndexLastVerifyOk = false;
+    g_webLibraryIndexLastSaveMs = 0;
+    g_webLibraryIndexLastSavedBytes = 0;
+    g_webLibraryIndexLastVerifyCount = 0;
+    g_webLibraryIndexLastSaveError = scanOk ? String("Refresco manual sin commit: cache RAM actualizada; SD no escrita") : String("Refresco manual falló: no se pudo escanear SD");
+
+    if (!scanOk) {
+      String err = "{\"ok\":false,\"source\":\"library_manual_live_scan\",\"refreshed\":true,\"manualRefresh\":true,\"indexCommit\":false,\"autoScanDisabled\":true,\"error\":\"SCAN_FAILED\",\"files\":[]}";
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(500, "application/json", err);
+      return;
+    }
+
+    webLibraryStreamApiResponseFromEntries(liveEntries,
+      String("library_manual_live_scan"), true, true, true, false, true, false,
+      rPage, rPageSize, rQ, rType, buildMs);
+    return;
+  }
+
+  // F43K: commit explícito con NDJSON. Escanea desde botón, guarda/verifica línea por línea
+  // y responde files[] por streaming seguro para evitar JSON truncado con pageSize alto.
+  if (commitRefresh) {
+    webLibraryLiveScanCacheInvalidate("manual commit ndjson stream");
+    std::vector<WebLibraryScanEntry> commitEntries;
+    bool commitCacheHit = false;
+    uint32_t commitCacheAge = 0;
+    uint32_t commitCacheBuild = 0;
+    bool commitCacheOk = webLibraryLiveScanCacheGet(commitEntries, true, commitCacheHit, commitCacheAge, commitCacheBuild);
+    bool ndjsonSaved = commitCacheOk && webLibraryNdjsonSaveFromEntries(commitEntries);
+
+    int cPageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 50);
+    if (cPageSize <= 0) cPageSize = 50;
+    if (cPageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) cPageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+    int cPage = server.hasArg("page") ? server.arg("page").toInt() : 0;
+    if (server.hasArg("offset")) cPage = server.arg("offset").toInt() / cPageSize;
+    if (cPage < 0) cPage = 0;
+    String cQ = server.hasArg("q") ? server.arg("q") : String(""); cQ.toLowerCase();
+    String cType = server.hasArg("type") ? server.arg("type") : String(""); cType.toUpperCase();
+
+    g_webLibraryIndexBuildMs = commitCacheBuild;
+    g_webLibraryIndexCount = commitEntries.size();
+
+    if (!commitCacheOk) {
+      String err = "{\"ok\":false,\"source\":\"library_ndjson_commit\",\"refreshed\":true,\"manualRefresh\":true,\"indexCommit\":true,\"ndjson\":true,\"error\":\"SCAN_FAILED\",\"files\":[]}";
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(500, "application/json", err);
+      return;
+    }
+
+    webLibraryStreamApiResponseFromEntries(commitEntries,
+      String("library_ndjson_commit"), (commitCacheOk && ndjsonSaved), true, true, true, true, true,
+      cPage, cPageSize, cQ, cType, commitCacheBuild,
+      ndjsonSaved ? String("") : g_webLibraryIndexLastSaveError);
+    return;
+  }
+
   bool indexOk = false;
   bool refreshFailed = false;
   String refreshError = "";
 
+  // F43I: commit=1 usa rebuild/guardado; refresh manual sin commit ya respondió arriba.
   // F43B: refresh=1&manual=1 sin commit ya no pasa por el rebuild antiguo.
   // Solo invalida cache y lista por live-scan paginado, evitando count parcial
   // y RAM/index JSON vacio. Para escribir SD se exige commit=1.
-  if (manualRefresh && !commitRefresh) {
-    webLibraryLiveScanCacheInvalidate("manual refresh live only");
-    manualRefresh = false;
-    forceRefresh = false;
-  }
-
   if (manualRefresh) {
     webLibraryLiveScanCacheInvalidate(commitRefresh ? "manual commit" : "manual refresh");
     bool prevConsoleScan = g_webLibraryConsoleScan;
@@ -15034,13 +15502,11 @@ void handleApiLibrary() {
   }
 
   int pageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 0);
-  // F42K: library_index.json es un ARRAY válido con todos los archivos.
-  // /api/library NO debe intentar devolver siempre los 148+ objetos en una sola respuesta
-  // porque eso puede cortar chunked encoding en ESP32 y dejar la UI con total pero sin lista.
-  // Por defecto se responde una página segura de 50. El total sigue informando todos los archivos.
-  // Quien necesite todo explícitamente puede pedir pageSize=10000.
-  if (pageSize <= 0) pageSize = 50;
-  if (pageSize > 10000) pageSize = 10000;
+  // F43P: /api/library nunca devuelve una página gigante.
+  // Esto NO limita el total: total/indexCount siguen informando todos los archivos encontrados,
+  // pero files[] se entrega en páginas de 50 para no fragmentar heap ni disparar reinicios.
+  if (pageSize <= 0) pageSize = WEB_LIBRARY_SAFE_HTTP_PAGE_SIZE;
+  if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
 
   int page = server.hasArg("page") ? server.arg("page").toInt() : 0;
   if (server.hasArg("offset")) page = server.arg("offset").toInt() / pageSize;
@@ -15048,12 +15514,67 @@ void handleApiLibrary() {
   String q = server.hasArg("q") ? server.arg("q") : String(""); q.toLowerCase();
   String type = server.hasArg("type") ? server.arg("type") : String(""); type.toUpperCase();
 
-  // F42Y: ruta principal para navegacion normal.
-  // Al presionar Biblioteca NO intentamos cargar library_index.json ni g_webLibraryIndexJson,
-  // porque en esta placa se vio load len=0 y abort() en la ruta de fallback.
-  // Se escanea la SD de forma segura y se devuelve solo la pagina visible.
+  // F43N: ruta principal para navegación normal.
+  // Regla final: refresh=0 NO escanea SD y NO usa library_index.json legacy.
+  // Primero lee /CONFIG/library_index.ndjson línea por línea. Si no existe,
+  // usa la cache RAM viva ya cargada por el botón manual. Si tampoco existe,
+  // pide refresco manual. Esto elimina los logs legacy:
+  //   load count=0 path=/CONFIG/library_index.json len=0
+  // y deja claro que la fuente persistente real es NDJSON.
   if (!manualRefresh) {
     if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
+
+    String ndEntries;
+    uint32_t ndTotal = 0;
+    uint32_t ndAll = 0, ndAtr = 0, ndXex = 0, ndCom = 0, ndExe = 0, ndBas = 0, ndCas = 0, ndSec = 0, ndOther = 0;
+    String ndSource;
+    uint32_t ndBytes = 0;
+
+    if (webLibraryNdjsonBestPage(page, pageSize, q, type, ndEntries, ndTotal,
+                                 ndAll, ndAtr, ndXex, ndCom, ndExe, ndBas, ndCas, ndSec, ndOther,
+                                 ndSource, ndBytes)) {
+      g_webLibraryIndexCount = ndAll;
+      String json;
+      json.reserve(4096 + ndEntries.length());
+      json = "{\"ok\":true";
+      json += ",\"source\":\"library_ndjson_index\"";
+      json += ",\"indexSource\":\"" + jsonEscape(ndSource) + "\"";
+      json += ",\"refreshed\":false";
+      json += ",\"indexCommit\":false";
+      json += ",\"autoScanDisabled\":true";
+      json += ",\"ndjson\":true";
+      json += ",\"usedLegacyJson\":false";
+      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
+      json += ",\"legacyJsonPathDisabled\":\"/CONFIG/library_index.json\"";
+      json += ",\"indexCount\":" + String(ndAll);
+      json += ",\"indexFileBytes\":" + String(ndBytes);
+      json += ",\"indexBuildMs\":" + String(g_webLibraryIndexBuildMs);
+      json += ",\"indexLoadMs\":0";
+      webLibraryAppendSaveStatusJson(json);
+      json += ",\"page\":" + String(page);
+      json += ",\"pageSize\":" + String(pageSize);
+      json += ",\"total\":" + String(ndTotal);
+      json += ",\"typeCounts\":{";
+      json += "\"ALL\":" + String(ndAll);
+      json += ",\"ATR\":" + String(ndAtr);
+      json += ",\"XEX\":" + String(ndXex);
+      json += ",\"COM\":" + String(ndCom);
+      json += ",\"EXE\":" + String(ndExe);
+      json += ",\"BAS\":" + String(ndBas);
+      json += ",\"CAS\":" + String(ndCas);
+      json += ",\"SEC\":" + String(ndSec);
+      json += ",\"OTHER\":" + String(ndOther);
+      json += "},\"files\":[";
+      json += ndEntries;
+      json += "]}";
+      server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      server.sendHeader("Pragma", "no-cache");
+      server.sendHeader("Expires", "0");
+      server.send(200, "application/json", json);
+      return;
+    }
+
+    // Fallback permitido: cache RAM creada por el botón manual. No escanea SD.
     String liveEntries;
     uint32_t liveTotal = 0;
     uint32_t lcAll = 0, lcAtr = 0, lcXex = 0, lcCom = 0, lcExe = 0, lcBas = 0, lcCas = 0, lcSec = 0, lcOther = 0;
@@ -15063,11 +15584,14 @@ void handleApiLibrary() {
       String json;
       json.reserve(4096 + liveEntries.length());
       json = "{\"ok\":true";
-      json += ",\"source\":\"library_live_scan_page\"";
+      json += ",\"source\":\"library_ram_cache_fallback\"";
       json += ",\"refreshed\":false";
-      json += ",\"refreshFailed\":false";
       json += ",\"indexCommit\":false";
-      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_PATH)) + "\"";
+      json += ",\"autoScanDisabled\":true";
+      json += ",\"ndjson\":false";
+      json += ",\"ndjsonMissing\":true";
+      json += ",\"message\":\"NDJSON no disponible; usando cache RAM creada por refresco manual\"";
+      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
       json += ",\"indexCount\":" + String(lcAll);
       json += ",\"indexBuildMs\":" + String(liveMs);
       json += ",\"indexLoadMs\":0";
@@ -15085,8 +15609,7 @@ void handleApiLibrary() {
       json += ",\"CAS\":" + String(lcCas);
       json += ",\"SEC\":" + String(lcSec);
       json += ",\"OTHER\":" + String(lcOther);
-      json += "}";
-      json += ",\"files\":[";
+      json += "},\"files\":[";
       json += liveEntries;
       json += "]}";
       server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
@@ -15095,14 +15618,15 @@ void handleApiLibrary() {
       server.send(200, "application/json", json);
       return;
     }
-    // F43C: si no hay cache de Biblioteca, no escaneamos automáticamente.
-    // El usuario debe presionar el botón Refrescar Biblioteca.
+
     String json = "{\"ok\":true";
-    json += ",\"source\":\"library_cache_only\"";
+    json += ",\"source\":\"library_ndjson_required\"";
     json += ",\"refreshed\":false";
     json += ",\"autoScanDisabled\":true";
+    json += ",\"ndjson\":true";
     json += ",\"needsManualRefresh\":true";
-    json += ",\"message\":\"Presiona Refrescar biblioteca para escanear la SD\"";
+    json += ",\"message\":\"Presiona Refrescar biblioteca para escanear la SD y crear /CONFIG/library_index.ndjson\"";
+    json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
     json += ",\"page\":" + String(page);
     json += ",\"pageSize\":" + String(pageSize);
     json += ",\"total\":0";
