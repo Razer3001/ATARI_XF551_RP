@@ -1,8 +1,8 @@
 // ================================================================
 // ATARI_XF551_RP - ESP32 MASTER
-// BUILD: F43Y_LIBRARY_DOT_MENU_CENTER_CARD_2026-05-25_2055
+// BUILD: F44N_ESPNOW_AUTO_CHANNEL_SYNC_2026-05-26_2125
 // DATE : 2026-05-25
-// TIME : 18:45
+// TIME : 19:15
 // ARCHIVO: ESP32_Master_Bridge.ino
 //
 // CAMBIOS VIGENTES:
@@ -46,6 +46,10 @@
 // - F43K: respuestas grandes files[] se envían por streaming seguro; evita String gigante y coma final },]}.
 // - F43M: agrega cache de listado en navegador y mejora carga diferida/persistente de carátulas.
 // - F43N: refresh=0 lee primero /CONFIG/library_index.ndjson; RAM/live cache queda solo como fallback sin escaneo.
+// - F44B: solo índices NDJSON por tipo; se elimina library_index.ndjson general.
+// - F44D: Biblioteca conserva nombres largos/reales y usa ruta SD como clave única.
+// - F44H: XEX/COM/EXE/BAS crudos montan en D: generando ATR virtual por unidad en /TMP; no deja la unidad forzada sin archivo.
+// - F44N: ESP-NOW sincroniza canal automaticamente con el router STA y avisa al SLAVE antes de cambiar.
 // - F43P: Biblioteca usa paginación HTTP segura de 50, sin límite total de archivos y sin fallback legacy JSON.
 // - F43Q: agrega botón Actualizar imágenes en Biblioteca; limpia cache local/missing y recarga carátulas visibles.
 // - F43R: restaura acciones de imagen por card en Biblioteca: Agregar URL, Subir imagen, Abrir Libretro, Guardar proxy SD y Quitar manual.
@@ -191,6 +195,12 @@ private:
     ensureDir("/COVERS");
     ensureDir("/MINI_COVERS");
     ensureDir("/CAS");
+    ensureDir("/XEX");
+    ensureDir("/COM");
+    ensureDir("/EXE");
+    ensureDir("/BAS");
+    ensureDir("/SEC");
+    ensureDir("/FILES");
   }
 };
 
@@ -216,7 +226,7 @@ static WebStorageAdapter WebStorage;
 
 Preferences prefs;
 
-static const char MASTER_BUILD[] = "F43Y_LIBRARY_DOT_MENU_CENTER_CARD_2026-05-25_2055";
+static const char MASTER_BUILD[] = "F44N_ESPNOW_AUTO_CHANNEL_SYNC_2026-05-26_2125";
 
 // ===== Debug =====
 #define MASTER_UART_BYTE_DEBUG 0   // 1 = logea cada byte UART (NO recomendado)
@@ -240,8 +250,13 @@ static const char MASTER_BUILD[] = "F43Y_LIBRARY_DOT_MENU_CENTER_CARD_2026-05-25
 // Broadcast MAC
 const uint8_t BCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
-// Canal WiFi fijo (AP + ESP-NOW). Debe coincidir en SLAVES.
+// Canal WiFi base de arranque (AP + ESP-NOW). F44N permite sincronizarlo dinamicamente.
 static const uint8_t WIFI_CHANNEL = 1;
+// F44N: La disquetera real usa ESP-NOW hacia el SLAVE/XF551, pero el canal puede
+// sincronizarse automaticamente al canal del router STA para recuperar acceso LAN.
+static const bool REAL_XF551_ESPNOW_PRIORITY = true;
+static uint8_t g_espNowDesiredChannel = WIFI_CHANNEL;
+static int g_staRouterChannelForSync = 0;
 
 // IMPORTANTÍSIMO:
 // El SoftAP del ESP32 por defecto usa 192.168.4.1/24.
@@ -1155,6 +1170,8 @@ static void markDeferredConfigSave(bool webAtr, bool btDisk, bool cas = false) {
 static bool webAtrFsReady();
 static void clearLastMasterOpLocal();
 static bool webAtrReadMetaFromPath(const String& path, WebAtrMeta &m);
+static bool webAtrConvertXexToDosAtr(const String& xexTmpPath, const String& atrDestPath, const String& storedName, String &err);
+static bool webAtrEnsureMountablePathForIndex(int idx, const String& requestedNameOrPath, WebAtrMeta &m, String* resolvedPathOut = nullptr, String* errOut = nullptr);
 static String webAtrResolvedPathForIndex(int idx);
 static bool webAtrReadMetaForIndex(int idx, WebAtrMeta &m, bool forceRefresh = false);
 static void webAtrResetResolvedSlot(int idx);
@@ -1715,16 +1732,79 @@ uint8_t calcSioChecksum(const uint8_t* buf, int len) {
   return (uint8_t)(s & 0xFF);
 }
 
+String formatMac(const uint8_t mac[6]);
+
+static uint8_t espNowCurrentChannel() {
+  uint8_t primary = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary > 0) return primary;
+  uint8_t ch = (uint8_t)WiFi.channel();
+  if (ch == 0) ch = g_espNowDesiredChannel ? g_espNowDesiredChannel : WIFI_CHANNEL;
+  return ch;
+}
+
+static void espNowLogChannelState(const char* tag) {
+  logf("[ESPNOW-CH] %s home=%u ap=%s sta=%s status=%d",
+       tag ? tag : "state",
+       (unsigned)espNowCurrentChannel(),
+       WiFi.softAPIP().toString().c_str(),
+       WiFi.localIP().toString().c_str(),
+       (int)WiFi.status());
+}
+
 void ensurePeer(const uint8_t* mac) {
   if (!mac) return;
-  if (esp_now_is_peer_exist(mac)) return;
+
+  // F44N: peer.channel=0 usa el canal Wi-Fi actual, según documentación ESP-IDF.
+  // El canal real se coordina con g_espNowDesiredChannel + TYPE_ESPNOW_CHANNEL_SYNC.
+  const uint8_t desiredPeerChannel = 0;
+
+  if (esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t existing = {};
+    if (esp_now_get_peer(mac, &existing) == ESP_OK) {
+      bool changed = false;
+      if (existing.channel != desiredPeerChannel) {
+        existing.channel = desiredPeerChannel;
+        changed = true;
+      }
+      if (existing.encrypt) {
+        existing.encrypt = false;
+        changed = true;
+      }
+      if (changed) {
+        esp_err_t me = esp_now_mod_peer(&existing);
+        if (me != ESP_OK) {
+          logf("[ESPNOW] esp_now_mod_peer error=%d peerCh=%u home=%u want=%u mac=%s",
+               (int)me,
+               (unsigned)desiredPeerChannel,
+               (unsigned)espNowCurrentChannel(),
+               (unsigned)g_espNowDesiredChannel,
+               formatMac(mac).c_str());
+          esp_now_del_peer(mac);
+        } else {
+          logf("[ESPNOW] peer dinamico OK peerCh=0 home=%u want=%u mac=%s",
+               (unsigned)espNowCurrentChannel(),
+               (unsigned)g_espNowDesiredChannel,
+               formatMac(mac).c_str());
+        }
+      }
+      return;
+    }
+    esp_now_del_peer(mac);
+  }
+
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = WIFI_CHANNEL;
+  p.channel = desiredPeerChannel;
   p.encrypt = false;
+  p.ifidx = WIFI_IF_STA;
   esp_err_t e = esp_now_add_peer(&p);
   if (e != ESP_OK) {
-    logf("[ESPNOW] esp_now_add_peer error=%d", (int)e);
+    logf("[ESPNOW] esp_now_add_peer error=%d peerCh=0 home=%u want=%u mac=%s",
+         (int)e,
+         (unsigned)espNowCurrentChannel(),
+         (unsigned)g_espNowDesiredChannel,
+         formatMac(mac).c_str());
   }
 }
 
@@ -1837,7 +1917,26 @@ static inline void throttleNet() {
 
 bool sendEspNow(const uint8_t* mac, const uint8_t* data, int len) {
   ensurePeer(mac);
-  bool ok = (esp_now_send(mac, data, len) == ESP_OK);
+  esp_err_t e = esp_now_send(mac, data, len);
+  if (e != ESP_OK) {
+    // F44K: si el peer quedó viejo o el canal cambió, se elimina/recrea y se reintenta una vez.
+    logf("[ESPNOW] send fail err=%d home=%u mac=%s; re-add dynamic peer",
+         (int)e,
+         (unsigned)espNowCurrentChannel(),
+         mac ? formatMac(mac).c_str() : "NULL");
+    if (mac) {
+      esp_now_del_peer(mac);
+      ensurePeer(mac);
+      e = esp_now_send(mac, data, len);
+      if (e != ESP_OK) {
+        logf("[ESPNOW] retry fail err=%d home=%u mac=%s",
+             (int)e,
+             (unsigned)espNowCurrentChannel(),
+             formatMac(mac).c_str());
+      }
+    }
+  }
+  bool ok = (e == ESP_OK);
   throttleNet();
   return ok;
 }
@@ -1845,6 +1944,35 @@ bool sendEspNow(const uint8_t* mac, const uint8_t* data, int len) {
 bool sendEspToSlave(uint8_t dev, const uint8_t* data, int len) {
   const uint8_t* mac = macForDev(dev);
   return sendEspNow(mac, data, len);
+}
+
+static bool espNowSendChannelSyncToSlaves(uint8_t newChannel, const char* reason) {
+  if (newChannel < 1 || newChannel > 13) return false;
+  uint8_t pkt[4];
+  pkt[0] = TYPE_ESPNOW_CHANNEL_SYNC;
+  pkt[1] = newChannel;
+  pkt[2] = WIFI_CHANNEL;
+  pkt[3] = calcChecksum(pkt, 3);
+  ensurePeer(BCAST_MAC);
+  esp_err_t e = esp_now_send(BCAST_MAC, pkt, sizeof(pkt));
+  logf("[ESPNOW-CH] sync request ch=%u oldBase=%u reason=%s send=%d home=%u",
+       (unsigned)newChannel,
+       (unsigned)WIFI_CHANNEL,
+       reason ? reason : "auto",
+       (int)e,
+       (unsigned)espNowCurrentChannel());
+  delay(180);
+  if (g_haveSlave) {
+    ensurePeer(g_lastSlave);
+    e = esp_now_send(g_lastSlave, pkt, sizeof(pkt));
+    logf("[ESPNOW-CH] sync unicast ch=%u send=%d mac=%s", (unsigned)newChannel, (int)e, formatMac(g_lastSlave).c_str());
+    delay(120);
+  }
+  g_espNowDesiredChannel = newChannel;
+  esp_now_del_peer(BCAST_MAC);
+  ensurePeer(BCAST_MAC);
+  if (g_haveSlave) { esp_now_del_peer(g_lastSlave); ensurePeer(g_lastSlave); }
+  return true;
 }
 
 static inline bool btDiskDevSelected(uint8_t dev) {
@@ -2084,7 +2212,7 @@ static bool webAtrLibraryScanSkipDir(String path) {
 }
 
 static String webAtrFindExistingRecursive(const char* dirPath, const String& storedName, uint8_t depth = 0) {
-  if (depth > 6) return String("");
+  if (depth > 10) return String("");
   String baseDir(dirPath);
   if (baseDir.length() == 0) baseDir = "/";
   if (webAtrLibraryScanSkipDir(baseDir)) return String("");
@@ -2163,6 +2291,73 @@ static String webAtrPathForName(const String& storedName) {
 #endif
 }
 
+
+static bool webAtrLooksLikeRawExecutablePath(String path) {
+  path.replace("\\", "/");
+  path.toLowerCase();
+  return path.endsWith(".xex") || path.endsWith(".com") || path.endsWith(".exe") || path.endsWith(".bas");
+}
+
+static String webAtrBaseNameLocal(String p) {
+  p.replace("\\", "/");
+  int slash = p.lastIndexOf('/');
+  if (slash >= 0) p = p.substring(slash + 1);
+  p.trim();
+  return p.length() ? p : String("GAME.XEX");
+}
+
+static String webAtrVirtualAtrPathForIndex(int idx) {
+  if (idx < 0) idx = 0;
+  if (idx >= WEB_ATR_MAX_UNITS) idx = WEB_ATR_MAX_UNITS - 1;
+  return String("/TMP/webatr_D") + String(idx + 1) + String("_raw_loader.atr");
+}
+
+// F44H: si el archivo montado es XEX/COM/EXE/BAS crudo, se genera una imagen ATR virtual
+// por unidad en /TMP. Así D2/D3 pueden montar ejecutables sin quedar como WEB-ATR-FORCED-NOFILE.
+static bool webAtrEnsureMountablePathForIndex(int idx, const String& requestedNameOrPath, WebAtrMeta &m, String* resolvedPathOut, String* errOut) {
+  memset(&m, 0, sizeof(m));
+  if (resolvedPathOut) *resolvedPathOut = String("");
+  if (errOut) *errOut = String("");
+  if (idx < 0 || idx >= WEB_ATR_MAX_UNITS) { if (errOut) *errOut = "Unidad invalida"; return false; }
+
+  String requested = requestedNameOrPath;
+  requested.replace("\\", "/");
+  requested.trim();
+  if (requested.length() == 0) { if (errOut) *errOut = "Archivo vacio"; return false; }
+
+  String path = webAtrPathForName(requested);
+  if (resolvedPathOut) *resolvedPathOut = path;
+
+  // ATR normal o XEX previamente convertido/subido como imagen ATR con extension visible .XEX.
+  if (webAtrReadMetaFromPath(path, m)) return true;
+
+  // XEX/COM/EXE/BAS crudo en su carpeta: crear ATR DOS virtual por unidad.
+  if (webAtrLooksLikeRawExecutablePath(path) && webAtrFsReady() && SPIFFS.exists(path)) {
+    (void)SPIFFS.mkdir("/TMP");
+    String tmpAtr = webAtrVirtualAtrPathForIndex(idx);
+    String convErr;
+    String visibleName = webAtrBaseNameLocal(requested.startsWith("/") ? requested : path);
+    if (webAtrConvertXexToDosAtr(path, tmpAtr, visibleName, convErr)) {
+      if (webAtrReadMetaFromPath(tmpAtr, m)) {
+        if (resolvedPathOut) *resolvedPathOut = tmpAtr;
+        logf("[WEB-ATR-XEX] virtual ATR OK dev=%s src=%s tmp=%s sectors=%lu size=%lu",
+             devName((uint8_t)(0x31 + idx)), path.c_str(), tmpAtr.c_str(),
+             (unsigned long)m.totalSectors, (unsigned long)m.fileSize);
+        return true;
+      }
+      if (errOut) *errOut = "ATR virtual generado pero metadata invalida";
+      return false;
+    }
+    if (errOut) *errOut = convErr.length() ? convErr : String("No se pudo generar ATR virtual para XEX");
+    logf("[WEB-ATR-XEX] virtual ATR FAIL dev=%s src=%s err=%s",
+         devName((uint8_t)(0x31 + idx)), path.c_str(), (errOut ? errOut->c_str() : ""));
+    return false;
+  }
+
+  if (errOut) *errOut = String("ATR/XEX no encontrado o invalido: ") + path;
+  return false;
+}
+
 static void webAtrResetResolvedSlot(int idx) {
   if (idx < 0 || idx >= WEB_ATR_MAX_UNITS) return;
   g_webAtrMountedPath[idx] = "";
@@ -2189,15 +2384,26 @@ static bool webAtrReadMetaForIndex(int idx, WebAtrMeta &m, bool forceRefresh) {
     webAtrResetResolvedSlot(idx);
     return false;
   }
-  if (!forceRefresh && g_webAtrSlotPresent[idx] && g_webAtrMountedMeta[idx].valid) {
+  if (!forceRefresh && g_webAtrSlotPresent[idx] && g_webAtrMountedMeta[idx].valid && g_webAtrMountedPath[idx].length() > 0) {
     m = g_webAtrMountedMeta[idx];
     return true;
   }
-  String path = webAtrResolvedPathForIndex(idx);
-  bool ok = webAtrReadMetaFromPath(path, m);
+
+  String resolvedPath;
+  String err;
+  bool ok = webAtrEnsureMountablePathForIndex(idx, g_webAtrMountedName[idx], m, &resolvedPath, &err);
+  g_webAtrMountedPath[idx] = resolvedPath;
   g_webAtrSlotPresent[idx] = ok;
-  if (ok) g_webAtrMountedMeta[idx] = m;
-  else memset(&g_webAtrMountedMeta[idx], 0, sizeof(g_webAtrMountedMeta[idx]));
+  if (ok) {
+    g_webAtrMountedMeta[idx] = m;
+  } else {
+    memset(&g_webAtrMountedMeta[idx], 0, sizeof(g_webAtrMountedMeta[idx]));
+    if (g_webAtrMountedName[idx].length()) {
+      logf("[WEB-ATR] slot no listo dev=%s name=%s path=%s err=%s",
+           devName((uint8_t)(0x31 + idx)), g_webAtrMountedName[idx].c_str(),
+           resolvedPath.c_str(), err.c_str());
+    }
+  }
   return ok;
 }
 
@@ -2342,6 +2548,7 @@ static void webAtrFillDosName83(const String& base, const String& sourceName, ui
   const char* ext = "XEX";
   if (n.endsWith(".com")) ext = "COM";
   else if (n.endsWith(".exe")) ext = "EXE";
+  else if (n.endsWith(".bas")) ext = "BAS";
   out3[0] = ext[0]; out3[1] = ext[1]; out3[2] = ext[2];
 }
 
@@ -2938,7 +3145,14 @@ static void sendLocalSectorChunkToRP(uint8_t dev, uint16_t sec, const uint8_t* b
 
 static bool webAtrDevEnabled(uint8_t dev) {
   int idx = webAtrUnitIndex(dev);
-  return (idx >= 0) && webAtrSelected(dev) && g_webAtrSlotPresent[idx];
+  if (idx < 0 || !webAtrSelected(dev)) return false;
+  // F44H: si la unidad quedó forzada con un XEX/COM/EXE/BAS crudo, intenta
+  // preparar el ATR virtual antes de decidir NAK. Esto evita WEB-ATR-FORCED-NOFILE.
+  if (!g_webAtrSlotPresent[idx] && g_webAtrMountedName[idx].length() > 0) {
+    WebAtrMeta m;
+    (void)webAtrReadMetaForIndex(idx, m, false);
+  }
+  return g_webAtrSlotPresent[idx];
 }
 
 static bool handleWebAtrFrame(uint8_t dev, const uint8_t* payload, uint8_t len) {
@@ -3569,8 +3783,12 @@ void loadConfigFromNvs() {
     char k[8];
     snprintf(k, sizeof(k), "atrD%d", i + 1);
     String v = prefs.getString(k, "");
+    v.replace("\\", "/");
+    v.trim();
     webAtrResetResolvedSlot(i);
-    g_webAtrMountedName[i] = v.length() ? webAtrSanitizeFileName(v) : String("");
+    if (v.length() == 0) g_webAtrMountedName[i] = String("");
+    else if (v.startsWith("/")) g_webAtrMountedName[i] = v;
+    else g_webAtrMountedName[i] = webAtrSanitizeFileName(v);
   }
   normalizeDriveMasks();
 
@@ -3637,7 +3855,13 @@ void sendTimingUpdateToRPThrottled(bool force) {
                  (lastComp != T_COMPLETE_TO_DATA) ||
                  (lastChk != T_DATA_TO_CHK) ||
                  (lastChunk != T_CHUNK_DELAY);
-  if (!force && !changed && (millis() - lastSentMs) < 3000) return;
+
+  // F44I: no reenviar TIMING_UPDATE periódico durante cargas WEB-ATR/XEX.
+  // Antes se reenviaba cada 3000 ms aunque los valores fueran iguales. En loaders
+  // rápidos esto metía un frame UART extra hacia el RP2040 y se veía como una
+  // micro-pausa cada cierto número de sectores. Ahora solo se envía si cambió o
+  // si el llamador lo fuerza explícitamente (boot, set_timing, cambios reales).
+  if (!force && !changed) return;
 
   sendTimingUpdateToRP();
   lastAck = T_ACK_TO_COMPLETE;
@@ -3748,22 +3972,40 @@ void connectPrinterStaWifi(bool waitForConnection) {
          MASTER_MDNS_HOST,
          printerWifiStatusText().c_str());
     startMdnsIfStaReady();
+    espNowLogChannelState("sta-connected");
+    esp_now_del_peer(BCAST_MAC);
+    ensurePeer(BCAST_MAC);
   } else {
     g_prnLastError = "No conecta STA a WiFi LAN: " + printerWifiStatusText();
     logf("[WIFI-LAN] %s", g_prnLastError.c_str());
+    espNowLogChannelState("sta-fail");
   }
 }
 
 static void startMdnsIfStaReady() {
-  if (WiFi.status() != WL_CONNECTED) return;
   if (g_mdnsStarted) return;
+
+  const bool staOk = (WiFi.status() == WL_CONNECTED);
+  const IPAddress apIp = WiFi.softAPIP();
+  const bool apOk = (apIp != IPAddress(0, 0, 0, 0));
+
+  // F44L: mDNS ya no depende solo de STA.
+  // Si el usuario se conecta al AP XF551_MASTER, también puede intentar http://atari-sio.local,
+  // aunque la URL garantizada sigue siendo http://192.168.50.1.
+  if (!staOk && !apOk) return;
 
   if (MDNS.begin(MASTER_MDNS_HOST)) {
     g_mdnsStarted = true;
     MDNS.addService("http", "tcp", 80);
-    logf("[MDNS] Disponible como http://%s.local", MASTER_MDNS_HOST);
+    logf("[MDNS] Disponible como http://%s.local ap=%s sta=%s",
+         MASTER_MDNS_HOST,
+         apIp.toString().c_str(),
+         staOk ? WiFi.localIP().toString().c_str() : "0.0.0.0");
   } else {
-    logf("[MDNS] No se pudo iniciar mDNS host=%s", MASTER_MDNS_HOST);
+    logf("[MDNS] No se pudo iniciar mDNS host=%s ap=%s sta=%s",
+         MASTER_MDNS_HOST,
+         apIp.toString().c_str(),
+         staOk ? WiFi.localIP().toString().c_str() : "0.0.0.0");
   }
 }
 
@@ -6147,8 +6389,8 @@ static String jsonEscapeString(const String& value) {
   for (size_t i = 0; i < value.length(); i++) {
     char c = value[i];
     switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
+      case '\\': out += "\\"; break;
+      case '"': out += "\""; break;
       case '\b': out += "\\b"; break;
       case '\f': out += "\\f"; break;
       case '\n': out += "\\n"; break;
@@ -9642,11 +9884,45 @@ static uint32_t g_webLibraryConsoleScanFound = 0;
 // El diagnóstico /api/fs confirma que /ATR y /CAS sí ven archivos. Para evitar
 // volver a buscar cada nombre desde raíz durante el armado del índice, el escaneo
 // conserva la ruta física encontrada y la usa directamente en el JSON.
-static bool webLibraryScanEntryContains(const std::vector<WebLibraryScanEntry>& entries, const String& name) {
+// F44D: para Biblioteca NO se debe usar webAtrSanitizeFileName().
+// Esa función es útil al subir archivos, pero recorta a 25 caracteres y elimina
+// espacios/paréntesis, provocando colisiones y archivos omitidos al escanear SD.
+// En Biblioteca se conserva el nombre real del archivo y se usa la ruta completa
+// como clave única.
+static String webLibraryBaseNameFromPath(String rawPath) {
+  rawPath.replace("\\", "/");
+  rawPath.trim();
+  int slash = rawPath.lastIndexOf('/');
+  String name = (slash >= 0) ? rawPath.substring(slash + 1) : rawPath;
+  name.trim();
+  String out;
+  out.reserve(name.length() + 4);
+  for (size_t i = 0; i < name.length(); i++) {
+    char c = name[i];
+    // Evita caracteres de control dentro del JSON/HTML, pero conserva nombres largos,
+    // espacios, paréntesis, guiones y otros caracteres válidos de FAT/SD.
+    if ((uint8_t)c >= 32 && c != '\"') out += c;
+  }
+  out.trim();
+  return out.length() ? out : String("archivo.ATR");
+}
+
+static bool webLibraryScanEntryContainsPath(const std::vector<WebLibraryScanEntry>& entries, const String& path) {
   for (const WebLibraryScanEntry& e : entries) {
-    if (e.name.equalsIgnoreCase(name)) return true;
+    if (e.path.equalsIgnoreCase(path)) return true;
   }
   return false;
+}
+
+static String webAtrNormalizeRequestFile(String raw) {
+  raw.replace("\\", "/");
+  raw.trim();
+  if (!raw.length()) return String("");
+  // Si viene desde Biblioteca, viene como ruta real SD: /ATR/Nombre largo (A).atr
+  // La ruta se guarda tal cual; webAtrPathForName() ya la acepta directamente.
+  if (raw.startsWith("/")) return raw;
+  // Para entradas antiguas/manuales mantenemos compatibilidad con nombres sanitizados.
+  return webAtrSanitizeFileName(raw);
 }
 
 static void webLibraryPushEntryUnique(std::vector<WebLibraryScanEntry>& entries, String rawPath, uint32_t rawSize = 0) {
@@ -9654,33 +9930,33 @@ static void webLibraryPushEntryUnique(std::vector<WebLibraryScanEntry>& entries,
   rawPath.trim();
   if (!rawPath.length()) return;
 
-  int slash = rawPath.lastIndexOf('/');
-  String rawName = (slash >= 0) ? rawPath.substring(slash + 1) : rawPath;
-  rawName.trim();
-  if (!webAtrIsMountableVisibleName(rawName)) return;
-
-  String clean = webAtrSanitizeFileName(rawName);
-  if (!clean.length()) return;
-  if (webLibraryScanEntryContains(entries, clean)) return;
-
   if (!rawPath.startsWith("/")) rawPath = String("/") + rawPath;
 
+  String rawName = webLibraryBaseNameFromPath(rawPath);
+  if (!webAtrIsMountableVisibleName(rawName)) return;
+
+  // Clave única por ruta completa, no por nombre sanitizado. Esto permite:
+  // - nombres mayores a 25 caracteres
+  // - nombres con espacios/paréntesis
+  // - archivos con el mismo nombre en carpetas distintas
+  if (webLibraryScanEntryContainsPath(entries, rawPath)) return;
+
   WebLibraryScanEntry e;
-  e.name = clean;
+  e.name = rawName;
   e.path = rawPath;
   e.fileSize = rawSize;
   entries.push_back(e);
   if (g_webLibraryConsoleScan) {
     g_webLibraryConsoleScanFound++;
-    String type = webAtrStoredTypeForName(clean);
-    logf("[LIB-SD] FOUND #%lu type=%s name=%s path=%s",
+    String type = webAtrStoredTypeForName(rawName);
+    logf("[LIB-SD] FOUND #%lu type=%s nameLen=%u pathLen=%u name=%s path=%s",
       (unsigned long)g_webLibraryConsoleScanFound,
-      type.c_str(), clean.c_str(), rawPath.c_str());
+      type.c_str(), (unsigned)rawName.length(), (unsigned)rawPath.length(), rawName.c_str(), rawPath.c_str());
   }
 }
 
 static void webLibraryCollectEntriesRecursive(std::vector<WebLibraryScanEntry>& entries, const char* dirPath, uint8_t depth = 0) {
-  if (!webAtrFsReady() || depth > 6) {
+  if (!webAtrFsReady() || depth > 10) {
     if (g_webLibraryConsoleScan) logf("[LIB-SD] SKIP dir=%s ready=%u depth=%u", dirPath, (unsigned)webAtrFsReady(), (unsigned)depth);
     return;
   }
@@ -9770,6 +10046,116 @@ static void webLibraryCollectEntriesShallow(std::vector<WebLibraryScanEntry>& en
   root.close();
 }
 
+static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries);
+
+// F44E: refresco selectivo real por carpeta/tipo. Cada tipo tiene su propio
+// NDJSON y también su propio escaneo de carpetas. Esto corrige XEX/COM/EXE/BAS
+// descargados en /XEX, /COM, /EXE, /BAS o dentro de subcarpetas por juego.
+static String webLibraryNormalizeScanTypeLocal(String type) {
+  type.trim();
+  type.replace(".", "");
+  type.toUpperCase();
+  if (type == "ATR" || type == "CAS" || type == "XEX" || type == "COM" ||
+      type == "EXE" || type == "BAS" || type == "SEC" || type == "OTHER") return type;
+  return String("");
+}
+
+static String webLibraryEntryTypeLocal(const WebLibraryScanEntry& entry) {
+  String type = webAtrStoredTypeForName(entry.name);
+  type.trim();
+  type.replace(".", "");
+  type.toUpperCase();
+  if (type == "ATR" || type == "CAS" || type == "XEX" || type == "COM" ||
+      type == "EXE" || type == "BAS" || type == "SEC") return type;
+  return String("OTHER");
+}
+
+static void webLibraryFilterEntriesForType(std::vector<WebLibraryScanEntry>& entries, const String& requestedType) {
+  String t = webLibraryNormalizeScanTypeLocal(requestedType);
+  if (!t.length()) return;
+  for (int i = (int)entries.size() - 1; i >= 0; i--) {
+    if (webLibraryEntryTypeLocal(entries[(size_t)i]) != t) entries.erase(entries.begin() + i);
+    if ((i & 0x0F) == 0) yield();
+  }
+}
+
+static void webLibraryCollectEntriesForType(std::vector<WebLibraryScanEntry>& entries, const String& requestedType) {
+  String t = webLibraryNormalizeScanTypeLocal(requestedType);
+  if (!t.length()) {
+    webLibraryCollectEntries(entries);
+    return;
+  }
+
+  if (g_webLibraryConsoleScan) {
+    g_webLibraryConsoleScanFound = 0;
+    logf("[LIB-SD-TYPE] ===== INICIO ESCANEO TIPO %s =====", t.c_str());
+    logf("[LIB-SD-TYPE] ready=%u backend=%s", (unsigned)webAtrFsReady(), WEB_STORAGE_NAME);
+  }
+
+#if WEB_STORAGE_USE_SD
+  if (t == "ATR") {
+    webLibraryCollectEntriesRecursive(entries, "/ATR");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/ATR");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/ATR");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "CAS") {
+    webLibraryCollectEntriesRecursive(entries, "/CAS");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/CAS");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/CAS");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "XEX") {
+    webLibraryCollectEntriesRecursive(entries, "/XEX");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/XEX");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/XEX");
+    webLibraryCollectEntriesRecursive(entries, "/FILES");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "COM") {
+    webLibraryCollectEntriesRecursive(entries, "/COM");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/COM");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/COM");
+    webLibraryCollectEntriesRecursive(entries, "/FILES");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "EXE") {
+    webLibraryCollectEntriesRecursive(entries, "/EXE");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/EXE");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/EXE");
+    webLibraryCollectEntriesRecursive(entries, "/FILES");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "BAS") {
+    webLibraryCollectEntriesRecursive(entries, "/BAS");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/BAS");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/BAS");
+    webLibraryCollectEntriesRecursive(entries, "/FILES");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else if (t == "SEC") {
+    webLibraryCollectEntriesRecursive(entries, "/SEC");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY/SEC");
+    webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/SEC");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  } else {
+    webLibraryCollectEntriesRecursive(entries, "/FILES");
+    webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
+    webLibraryCollectEntriesShallow(entries, "/");
+  }
+#else
+  webLibraryCollectEntries(entries);
+#endif
+
+  webLibraryFilterEntriesForType(entries, t);
+
+  if (g_webLibraryConsoleScan) {
+    logf("[LIB-SD-TYPE] ===== FIN ESCANEO TIPO %s: entries=%lu =====",
+         t.c_str(), (unsigned long)entries.size());
+  }
+}
+
 static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries) {
   if (g_webLibraryConsoleScan) {
     g_webLibraryConsoleScanFound = 0;
@@ -9779,9 +10165,20 @@ static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries) 
 #if WEB_STORAGE_USE_SD
   webLibraryCollectEntriesRecursive(entries, "/ATR");
   webLibraryCollectEntriesRecursive(entries, "/CAS");
+  webLibraryCollectEntriesRecursive(entries, "/XEX");
+  webLibraryCollectEntriesRecursive(entries, "/COM");
+  webLibraryCollectEntriesRecursive(entries, "/EXE");
+  webLibraryCollectEntriesRecursive(entries, "/BAS");
+  webLibraryCollectEntriesRecursive(entries, "/SEC");
+  webLibraryCollectEntriesRecursive(entries, "/FILES");
   webLibraryCollectEntriesRecursive(entries, "/LIBRARY");
   webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/ATR");
   webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/CAS");
+  webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/XEX");
+  webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/COM");
+  webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/EXE");
+  webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/BAS");
+  webLibraryCollectEntriesRecursive(entries, "/SD_CARD_CONTENT/SEC");
   webLibraryCollectEntriesShallow(entries, "/");
 #else
   std::vector<String> names;
@@ -9805,7 +10202,7 @@ static void webLibraryCollectEntries(std::vector<WebLibraryScanEntry>& entries) 
 
 // [F24] Eliminado helper no usado: webAtrCollectFilesFromDir
 static void webAtrCollectFilesRecursive(std::vector<String>& names, const char* dirPath, uint8_t depth = 0) {
-  if (!webAtrFsReady() || depth > 6) return;
+  if (!webAtrFsReady() || depth > 10) return;
   String baseDir(dirPath);
   if (baseDir.length() == 0) baseDir = "/";
   if (webAtrLibraryScanSkipDir(baseDir)) return;
@@ -9872,9 +10269,20 @@ static void webAtrCollectFiles(std::vector<String>& names) {
   // la carpeta SD_CARD_CONTENT completa dentro de la tarjeta.
   webAtrCollectFilesRecursive(names, "/ATR");
   webAtrCollectFilesRecursive(names, "/CAS");
+  webAtrCollectFilesRecursive(names, "/XEX");
+  webAtrCollectFilesRecursive(names, "/COM");
+  webAtrCollectFilesRecursive(names, "/EXE");
+  webAtrCollectFilesRecursive(names, "/BAS");
+  webAtrCollectFilesRecursive(names, "/SEC");
+  webAtrCollectFilesRecursive(names, "/FILES");
   webAtrCollectFilesRecursive(names, "/LIBRARY");
   webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/ATR");
   webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/CAS");
+  webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/XEX");
+  webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/COM");
+  webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/EXE");
+  webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/BAS");
+  webAtrCollectFilesRecursive(names, "/SD_CARD_CONTENT/SEC");
   webAtrCollectFilesShallow(names, "/");
 #else
   File root = SPIFFS.open("/");
@@ -10079,7 +10487,7 @@ static void webLibraryAppendScanEntryJson(String &j, const WebLibraryScanEntry &
   j += ",\"sectorSize\":" + String(outSectorSize);
   j += ",\"totalSectors\":" + String(outTotalSectors);
   uint8_t mm = 0;
-  for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) if (g_webAtrMountedName[i] == name) mm |= (1u << i);
+  for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) if (g_webAtrMountedName[i].equalsIgnoreCase(name) || g_webAtrMountedName[i].equalsIgnoreCase(path)) mm |= (1u << i);
   j += ",\"mountedMask\":" + String(mm);
   j += ",\"casMounted\":" + String(casThisMounted ? 1 : 0);
   j += ",\"casPlaying\":" + String((casThisMounted && g_casPlaying) ? 1 : 0);
@@ -10228,6 +10636,11 @@ static bool webLibraryBuildLiveVisiblePage(int page, int pageSize, const String&
   return true;
 }
 
+// F44C: prototipos necesarios antes de la respuesta streaming.
+// Arduino IDE no siempre genera prototype correcto para funciones con String/default args.
+static String webLibraryNormalizeTypeForIndex(String type);
+static String webLibraryNdjsonTypePath(const String& type, const char* suffix = "");
+
 // F43K/F43P: enviar /api/library por streaming y mantener páginas HTTP chicas.
 // Evita construir un String gigante con files[]; en F43J con pageSize alto podía
 // fragmentarse y terminar en JSON inválido: },]} o en objetos truncados.
@@ -10279,9 +10692,12 @@ static bool webLibraryStreamApiResponseFromEntries(const std::vector<WebLibraryS
   head += ",\"autoScanDisabled\":true";
   if (indexCommitFlag) head += ",\"commitReturnedFiles\":" + String(commitReturnedFilesFlag ? "true" : "false");
   head += ",\"streamedFiles\":true";
-  head += ",\"indexPath\":\"" + jsonEscape(String("/CONFIG/library_index.ndjson")) + "\"";
+  String streamType = webLibraryNormalizeTypeForIndex(typeUpper);
+  String streamIndexPath = streamType.length() ? webLibraryNdjsonTypePath(streamType) : String("type-required");
+  head += ",\"indexPath\":\"" + jsonEscape(streamIndexPath) + "\"";
+  head += ",\"generalIndexRemoved\":true";
   head += ",\"legacyJsonPathDisabled\":\"/CONFIG/library_index.json\"";
-  head += ",\"indexCount\":" + String((unsigned)entries.size());
+  head += ",\"indexCount\":" + String(streamType.length() ? totalMatches : (uint32_t)entries.size());
   head += ",\"indexBuildMs\":" + String(indexBuildMs);
   head += ",\"indexLoadMs\":0";
   if (extraError.length()) head += ",\"streamError\":\"" + jsonEscape(extraError) + "\"";
@@ -10380,7 +10796,7 @@ static void webAtrAppendFileListJson(String &j) {
     j += ",\"sectorSize\":" + String(outSectorSize);
     j += ",\"totalSectors\":" + String(outTotalSectors);
     uint8_t mm = 0;
-    for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) if (g_webAtrMountedName[i] == name) mm |= (1u << i);
+    for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) if (g_webAtrMountedName[i].equalsIgnoreCase(name) || g_webAtrMountedName[i].equalsIgnoreCase(path)) mm |= (1u << i);
     j += ",\"mountedMask\":" + String(mm);
     j += ",\"casMounted\":" + String(casThisMounted ? 1 : 0);
     j += ",\"casPlaying\":" + String((casThisMounted && g_casPlaying) ? 1 : 0);
@@ -10436,6 +10852,10 @@ static const char WEB_LIBRARY_INDEX_NDJSON_PATH[] = "/CONFIG/library_index.ndjso
 static const char WEB_LIBRARY_INDEX_NDJSON_BAK_PATH[] = "/CONFIG/library_index.bak.ndjson";
 static const char WEB_LIBRARY_INDEX_NDJSON_TMP_PATH[] = "/CONFIG/library_index.tmp.ndjson";
 static const char WEB_LIBRARY_INDEX_NDJSON_PREV_PATH[] = "/CONFIG/library_index.prev.ndjson";
+// F44B: índices NDJSON separados por tipo. No se usa índice general.
+// Ejemplos: /CONFIG/library_ATR_index.ndjson, /CONFIG/library_CAS_index.ndjson.
+static const char* WEB_LIBRARY_TYPE_INDEX_TYPES[] = { "ATR", "CAS", "XEX", "COM", "EXE", "BAS", "SEC", "OTHER" };
+static const int WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT = sizeof(WEB_LIBRARY_TYPE_INDEX_TYPES) / sizeof(WEB_LIBRARY_TYPE_INDEX_TYPES[0]);
 static String   g_webLibraryIndexJson;
 static bool     g_webLibraryIndexLoaded = false;
 static bool     g_webLibraryIndexDirty = false;
@@ -11183,6 +11603,219 @@ static bool webLibraryObjectMatches(const String& obj, const String& qLower, con
   return true;
 }
 
+static bool webLibraryNdjsonVerifyFileAt(const char* path, uint32_t expectedCount, uint32_t expectedBytes,
+                                         uint32_t& verifyCount, uint32_t& fileBytes);
+static bool webLibraryNdjsonCopyFile(const char* from, const char* to);
+
+static String webLibraryNormalizeTypeForIndex(String type) {
+  type.trim();
+  type.replace(".", "");
+  type.toUpperCase();
+  if (!type.length() || type == "ALL") return String("");
+  for (int i = 0; i < WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT; i++) {
+    if (type == WEB_LIBRARY_TYPE_INDEX_TYPES[i]) return type;
+  }
+  return String("");
+}
+
+static String webLibraryEntryTypeForIndex(const WebLibraryScanEntry& entry) {
+  String type = webAtrStoredTypeForName(entry.name);
+  type.trim();
+  type.replace(".", "");
+  type.toUpperCase();
+  if (type == "ATR" || type == "CAS" || type == "XEX" || type == "COM" || type == "EXE" || type == "BAS" || type == "SEC") return type;
+  return String("OTHER");
+}
+
+static String webLibraryNdjsonTypePath(const String& type, const char* suffix) {
+  String t = webLibraryNormalizeTypeForIndex(type);
+  if (!t.length()) return String("");
+  String p = String("/CONFIG/library_") + t + String("_index") + String(suffix ? suffix : "") + String(".ndjson");
+  return p;
+}
+
+static bool webLibraryNdjsonCountObjectsAt(const char* path, uint32_t& countOut, uint32_t& bytesOut) {
+  countOut = 0;
+  bytesOut = 0;
+  if (!webAtrFsReady() || !SPIFFS.exists(path)) return false;
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  bytesOut = (uint32_t)f.size();
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("{") && line.endsWith("}") && line.indexOf("\"name\"") >= 0 && line.indexOf("\"path\"") >= 0) countOut++;
+    if ((countOut & 0x1F) == 0) yield();
+  }
+  f.close();
+  return countOut > 0;
+}
+
+static void webLibraryNdjsonTypeCountsFromFiles(uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other) {
+  all = atr = xex = com = exe = bas = cas = sec = other = 0;
+  for (int i = 0; i < WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT; i++) {
+    String type = String(WEB_LIBRARY_TYPE_INDEX_TYPES[i]);
+    String path = webLibraryNdjsonTypePath(type);
+    uint32_t c = 0, b = 0;
+    if (!webLibraryNdjsonCountObjectsAt(path.c_str(), c, b)) c = 0;
+    all += c;
+    if (type == "ATR") atr = c;
+    else if (type == "XEX") xex = c;
+    else if (type == "COM") com = c;
+    else if (type == "EXE") exe = c;
+    else if (type == "BAS") bas = c;
+    else if (type == "CAS") cas = c;
+    else if (type == "SEC") sec = c;
+    else other = c;
+    yield();
+  }
+}
+
+static bool webLibraryNdjsonSaveTypeIndex(const std::vector<WebLibraryScanEntry>& entries, const String& type, uint32_t& savedCount, uint32_t& savedBytes) {
+  savedCount = 0;
+  savedBytes = 0;
+  String t = webLibraryNormalizeTypeForIndex(type);
+  if (!t.length()) return false;
+  String path = webLibraryNdjsonTypePath(t);
+  String tmp = webLibraryNdjsonTypePath(t, ".tmp");
+  String bak = webLibraryNdjsonTypePath(t, ".bak");
+  if (SPIFFS.exists(tmp.c_str())) SPIFFS.remove(tmp.c_str());
+  File f = SPIFFS.open(tmp.c_str(), "w");
+  if (!f) return false;
+  bool ok = true;
+  for (const WebLibraryScanEntry& entry : entries) {
+    if (webLibraryEntryTypeForIndex(entry) != t) continue;
+    String obj;
+    obj.reserve(768);
+    webLibraryAppendScanEntryJson(obj, entry);
+    size_t w1 = f.print(obj);
+    size_t w2 = f.print('\n');
+    savedBytes += (uint32_t)(w1 + w2);
+    if (w1 != obj.length() || w2 != 1) { ok = false; break; }
+    savedCount++;
+    if ((savedCount & 0x0F) == 0) yield();
+  }
+  f.flush();
+  f.close();
+  if (!ok || savedCount == 0) {
+    if (SPIFFS.exists(tmp.c_str())) SPIFFS.remove(tmp.c_str());
+    if (SPIFFS.exists(path.c_str())) SPIFFS.remove(path.c_str());
+    if (SPIFFS.exists(bak.c_str())) SPIFFS.remove(bak.c_str());
+    return ok; // ok=true con count=0 significa tipo sin archivos.
+  }
+  uint32_t verifyCount = 0, verifyBytes = 0;
+  if (!webLibraryNdjsonVerifyFileAt(tmp.c_str(), savedCount, savedBytes, verifyCount, verifyBytes)) {
+    if (SPIFFS.exists(tmp.c_str())) SPIFFS.remove(tmp.c_str());
+    return false;
+  }
+  if (SPIFFS.exists(bak.c_str())) SPIFFS.remove(bak.c_str());
+  if (SPIFFS.exists(path.c_str())) {
+    if (!SPIFFS.rename(path.c_str(), bak.c_str())) {
+      webLibraryNdjsonCopyFile(path.c_str(), bak.c_str());
+      SPIFFS.remove(path.c_str());
+    }
+  }
+  bool promoted = SPIFFS.rename(tmp.c_str(), path.c_str());
+  if (!promoted) promoted = webLibraryNdjsonCopyFile(tmp.c_str(), path.c_str());
+  uint32_t finalCount = 0, finalBytes = 0;
+  bool finalOk = promoted && webLibraryNdjsonVerifyFileAt(path.c_str(), savedCount, savedBytes, finalCount, finalBytes);
+  if (!finalOk) {
+    if (SPIFFS.exists(path.c_str())) SPIFFS.remove(path.c_str());
+    if (SPIFFS.exists(bak.c_str())) SPIFFS.rename(bak.c_str(), path.c_str());
+    return false;
+  }
+  if (SPIFFS.exists(tmp.c_str())) SPIFFS.remove(tmp.c_str());
+  savedCount = finalCount;
+  savedBytes = finalBytes;
+  logf("[LIB-NDJSON-TYPE] save ok=1 type=%s bytes=%lu count=%lu path=%s",
+       t.c_str(), (unsigned long)savedBytes, (unsigned long)savedCount, path.c_str());
+  return true;
+}
+
+static bool webLibraryNdjsonSaveTypeIndexesFromEntries(const std::vector<WebLibraryScanEntry>& entries) {
+  bool allOk = true;
+  uint32_t totalTypeCount = 0;
+  for (int i = 0; i < WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT; i++) {
+    uint32_t c = 0, b = 0;
+    String t = String(WEB_LIBRARY_TYPE_INDEX_TYPES[i]);
+    bool ok = webLibraryNdjsonSaveTypeIndex(entries, t, c, b);
+    if (!ok) allOk = false;
+    totalTypeCount += c;
+    yield();
+  }
+  logf("[LIB-NDJSON-TYPE] save summary ok=%u totalTypeCount=%lu sourceEntries=%lu",
+       (unsigned)(allOk ? 1 : 0), (unsigned long)totalTypeCount, (unsigned long)entries.size());
+  return allOk;
+}
+
+static bool webLibraryNdjsonSaveSingleTypeFromEntries(const std::vector<WebLibraryScanEntry>& entries, const String& requestedType) {
+  // F44C: refresco selectivo. Se actualiza solo el NDJSON del tipo pedido
+  // y no se toca el resto de índices por tipo.
+  uint32_t t0 = millis();
+  String t = webLibraryNormalizeTypeForIndex(requestedType);
+  g_webLibraryIndexLastSaveOk = false;
+  g_webLibraryIndexLastVerifyOk = false;
+  g_webLibraryIndexLastSavedBytes = 0;
+  g_webLibraryIndexLastVerifyCount = 0;
+  g_webLibraryIndexLastSaveError = "";
+
+  if (!t.length()) {
+    g_webLibraryIndexLastSaveError = "Tipo requerido para refresco selectivo de Biblioteca";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+  if (!webLibraryEnsureConfigDir()) {
+    g_webLibraryIndexLastSaveError = "No se pudo crear/acceder /CONFIG para índice NDJSON por tipo";
+    g_webLibraryIndexLastSaveMs = millis() - t0;
+    return false;
+  }
+
+  webLibraryNdjsonCleanupGeneralIndexes();
+
+  uint32_t savedCount = 0, savedBytes = 0;
+  bool ok = webLibraryNdjsonSaveTypeIndex(entries, t, savedCount, savedBytes);
+
+  uint32_t cAll = 0, cAtr = 0, cXex = 0, cCom = 0, cExe = 0, cBas = 0, cCas = 0, cSec = 0, cOther = 0;
+  webLibraryNdjsonTypeCountsFromFiles(cAll, cAtr, cXex, cCom, cExe, cBas, cCas, cSec, cOther);
+
+  g_webLibraryIndexLastVerifyCount = savedCount;
+  g_webLibraryIndexLastVerifyOk = ok;
+  g_webLibraryIndexLastSaveOk = ok;
+  g_webLibraryIndexLastSavedBytes = savedBytes;
+  g_webLibraryIndexLastSaveMs = millis() - t0;
+  g_webLibraryIndexCount = cAll;
+  g_webLibraryIndexLastSaveError = ok ? String("") : String("Falló índice NDJSON tipo ") + t;
+
+  logf("[LIB-NDJSON-TYPE] selective save ok=%u type=%s count=%lu bytes=%lu totalAll=%lu ms=%lu",
+       (unsigned)(ok ? 1 : 0), t.c_str(), (unsigned long)savedCount,
+       (unsigned long)savedBytes, (unsigned long)cAll, (unsigned long)g_webLibraryIndexLastSaveMs);
+  return ok;
+}
+
+
+static void webLibraryNdjsonCleanupGeneralIndexes() {
+  if (!webAtrFsReady()) return;
+  const char* paths[] = {
+    WEB_LIBRARY_INDEX_NDJSON_PATH,
+    WEB_LIBRARY_INDEX_NDJSON_BAK_PATH,
+    WEB_LIBRARY_INDEX_NDJSON_TMP_PATH,
+    WEB_LIBRARY_INDEX_NDJSON_PREV_PATH,
+    WEB_LIBRARY_INDEX_PATH,
+    WEB_LIBRARY_INDEX_BAK_PATH,
+    WEB_LIBRARY_INDEX_TMP_PATH,
+    WEB_LIBRARY_INDEX_PREV_PATH
+  };
+  uint8_t removed = 0;
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    if (paths[i] && SPIFFS.exists(paths[i])) {
+      if (SPIFFS.remove(paths[i])) removed++;
+      delay(1);
+    }
+  }
+  if (removed) logf("[LIB-NDJSON-TYPE] general indexes removed=%u; using type-only NDJSON", (unsigned)removed);
+}
+
+
 
 // F43J: guardar índice en NDJSON, una entrada por línea.
 // No se usa un array JSON gigante ni se carga el archivo completo a RAM.
@@ -11230,6 +11863,8 @@ static bool webLibraryNdjsonCopyFile(const char* from, const char* to) {
 }
 
 static bool webLibraryNdjsonSaveFromEntries(const std::vector<WebLibraryScanEntry>& entries) {
+  // F44B: no se escribe /CONFIG/library_index.ndjson general.
+  // Solo se reconstruyen índices por tipo: library_ATR_index.ndjson, library_CAS_index.ndjson, etc.
   uint32_t t0 = millis();
   g_webLibraryIndexLastSaveOk = false;
   g_webLibraryIndexLastVerifyOk = false;
@@ -11238,99 +11873,51 @@ static bool webLibraryNdjsonSaveFromEntries(const std::vector<WebLibraryScanEntr
   g_webLibraryIndexLastSaveError = "";
 
   if (!webLibraryEnsureConfigDir()) {
-    g_webLibraryIndexLastSaveError = "No se pudo crear/acceder /CONFIG para NDJSON";
+    g_webLibraryIndexLastSaveError = "No se pudo crear/acceder /CONFIG para índices NDJSON por tipo";
     g_webLibraryIndexLastSaveMs = millis() - t0;
     return false;
   }
   if (entries.empty()) {
-    g_webLibraryIndexLastSaveError = "Protegido: no se escribe índice NDJSON vacío";
+    g_webLibraryIndexLastSaveError = "Protegido: no se escriben índices NDJSON por tipo vacíos";
     g_webLibraryIndexLastSaveMs = millis() - t0;
+    webLibraryNdjsonCleanupGeneralIndexes();
     return false;
   }
 
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
-  File f = SPIFFS.open(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, "w");
-  if (!f) {
-    g_webLibraryIndexLastSaveError = "No se pudo abrir library_index.tmp.ndjson";
-    g_webLibraryIndexLastSaveMs = millis() - t0;
-    return false;
+  // El índice general antiguo fue el origen de listados parciales/corruptos.
+  // Lo eliminamos en cada refresh manual para que ninguna ruta vuelva a usarlo.
+  webLibraryNdjsonCleanupGeneralIndexes();
+
+  bool typeIndexesOk = webLibraryNdjsonSaveTypeIndexesFromEntries(entries);
+
+  uint32_t totalTypeCount = 0;
+  uint32_t totalTypeBytes = 0;
+  uint32_t cAll = 0, cAtr = 0, cXex = 0, cCom = 0, cExe = 0, cBas = 0, cCas = 0, cSec = 0, cOther = 0;
+  webLibraryNdjsonTypeCountsFromFiles(cAll, cAtr, cXex, cCom, cExe, cBas, cCas, cSec, cOther);
+  totalTypeCount = cAll;
+  for (int i = 0; i < WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT; i++) {
+    String path = webLibraryNdjsonTypePath(String(WEB_LIBRARY_TYPE_INDEX_TYPES[i]));
+    uint32_t c = 0, b = 0;
+    if (path.length() && webLibraryNdjsonCountObjectsAt(path.c_str(), c, b)) totalTypeBytes += b;
+    yield();
   }
 
-  uint32_t written = 0;
-  uint32_t count = 0;
-  bool ok = true;
-  for (const WebLibraryScanEntry& entry : entries) {
-    String obj;
-    obj.reserve(768);
-    webLibraryAppendScanEntryJson(obj, entry);
-    size_t w1 = f.print(obj);
-    size_t w2 = f.print('\n');
-    written += (uint32_t)(w1 + w2);
-    if (w1 != obj.length() || w2 != 1) { ok = false; break; }
-    count++;
-    if ((count & 0x0F) == 0) yield();
-  }
-  f.flush();
-  f.close();
-
-  g_webLibraryIndexLastSavedBytes = written;
-  if (!ok || count != entries.size()) {
-    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
-    g_webLibraryIndexLastSaveError = String("Escritura NDJSON incompleta count=") + String(count) + " expected=" + String((unsigned)entries.size());
-    g_webLibraryIndexLastSaveMs = millis() - t0;
-    return false;
-  }
-
-  uint32_t verifyCount = 0;
-  uint32_t fileBytes = 0;
-  bool tmpOk = webLibraryNdjsonVerifyFileAt(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, count, written, verifyCount, fileBytes);
-  if (!tmpOk) {
-    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
-    g_webLibraryIndexLastVerifyCount = verifyCount;
-    g_webLibraryIndexLastSaveError = String("TMP NDJSON inválido count=") + String(verifyCount) + " expected=" + String(count) +
-      " bytes=" + String(fileBytes) + "/" + String(written);
-    g_webLibraryIndexLastSaveMs = millis() - t0;
-    return false;
-  }
-
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PATH)) {
-    if (!SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) {
-      webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
-      SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PATH);
-    }
-  }
-
-  bool promoted = SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
-  if (!promoted) promoted = webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
-
-  uint32_t finalCount = 0;
-  uint32_t finalBytes = 0;
-  bool finalOk = promoted && webLibraryNdjsonVerifyFileAt(WEB_LIBRARY_INDEX_NDJSON_PATH, count, written, finalCount, finalBytes);
-  if (!finalOk) {
-    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PATH);
-    if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.rename(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH, WEB_LIBRARY_INDEX_NDJSON_PATH);
-    g_webLibraryIndexLastVerifyCount = finalCount;
-    g_webLibraryIndexLastSaveError = String("Promoción NDJSON fallida count=") + String(finalCount) + " expected=" + String(count) +
-      " bytes=" + String(finalBytes) + "/" + String(written);
-    g_webLibraryIndexLastSaveMs = millis() - t0;
-    return false;
-  }
-
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_TMP_PATH);
-  if (SPIFFS.exists(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH)) SPIFFS.remove(WEB_LIBRARY_INDEX_NDJSON_PREV_PATH);
-  webLibraryNdjsonCopyFile(WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH);
-
-  g_webLibraryIndexLastVerifyCount = finalCount;
-  g_webLibraryIndexLastVerifyOk = true;
-  g_webLibraryIndexLastSaveOk = true;
+  g_webLibraryIndexLastVerifyCount = totalTypeCount;
+  g_webLibraryIndexLastVerifyOk = typeIndexesOk && (totalTypeCount > 0);
+  g_webLibraryIndexLastSaveOk = g_webLibraryIndexLastVerifyOk;
+  g_webLibraryIndexLastSavedBytes = totalTypeBytes;
   g_webLibraryIndexLastSaveMs = millis() - t0;
-  g_webLibraryIndexLastSaveError = "";
-  g_webLibraryIndexCount = count;
-  logf("[LIB-NDJSON] save ok=1 bytes=%lu count=%lu ms=%lu path=%s",
-       (unsigned long)finalBytes, (unsigned long)finalCount, (unsigned long)g_webLibraryIndexLastSaveMs,
-       WEB_LIBRARY_INDEX_NDJSON_PATH);
-  return true;
+  g_webLibraryIndexCount = totalTypeCount;
+  g_webLibraryIndexLastSaveError = g_webLibraryIndexLastSaveOk ? String("") : String("Falló uno o más índices NDJSON por tipo");
+
+  logf("[LIB-NDJSON-TYPE] type-only save ok=%u total=%lu bytes=%lu ms=%lu ATR=%lu XEX=%lu COM=%lu EXE=%lu BAS=%lu CAS=%lu SEC=%lu OTHER=%lu",
+       (unsigned)(g_webLibraryIndexLastSaveOk ? 1 : 0),
+       (unsigned long)totalTypeCount,
+       (unsigned long)totalTypeBytes,
+       (unsigned long)g_webLibraryIndexLastSaveMs,
+       (unsigned long)cAtr, (unsigned long)cXex, (unsigned long)cCom, (unsigned long)cExe,
+       (unsigned long)cBas, (unsigned long)cCas, (unsigned long)cSec, (unsigned long)cOther);
+  return g_webLibraryIndexLastSaveOk;
 }
 
 static bool webLibraryNdjsonPageFromPath(const char* path, int page, int pageSize, const String& qLower, const String& typeUpper,
@@ -11393,37 +11980,51 @@ static bool webLibraryNdjsonBestPage(int page, int pageSize, const String& qLowe
                                      String& pageEntries, uint32_t& totalMatches,
                                      uint32_t& all, uint32_t& atr, uint32_t& xex, uint32_t& com, uint32_t& exe, uint32_t& bas, uint32_t& cas, uint32_t& sec, uint32_t& other,
                                      String& sourceOut, uint32_t& fileBytesOut) {
-  const char* paths[] = { WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH };
-  const char* names[] = { "ndjson", "ndjson_bak", "ndjson_prev" };
-  for (int i = 0; i < 3; i++) {
-    if (webLibraryNdjsonPageFromPath(paths[i], page, pageSize, qLower, typeUpper, pageEntries, totalMatches,
+  // F44B: no existe índice general. Toda lectura normal exige type=ATR/CAS/XEX/etc.
+  String requestedType = webLibraryNormalizeTypeForIndex(typeUpper);
+  if (!requestedType.length()) {
+    pageEntries = "";
+    totalMatches = 0;
+    all = atr = xex = com = exe = bas = cas = sec = other = 0;
+    fileBytesOut = 0;
+    sourceOut = "type_required";
+    return false;
+  }
+
+  String paths[2] = { webLibraryNdjsonTypePath(requestedType), webLibraryNdjsonTypePath(requestedType, ".bak") };
+  const char* names[] = { "ndjson_type", "ndjson_type_bak" };
+  for (int i = 0; i < 2; i++) {
+    if (!paths[i].length()) continue;
+    if (webLibraryNdjsonPageFromPath(paths[i].c_str(), page, pageSize, qLower, requestedType, pageEntries, totalMatches,
                                      all, atr, xex, com, exe, bas, cas, sec, other, fileBytesOut)) {
-      sourceOut = names[i];
+      uint32_t ca = 0, cAtr = 0, cXex = 0, cCom = 0, cExe = 0, cBas = 0, cCas = 0, cSec = 0, cOther = 0;
+      webLibraryNdjsonTypeCountsFromFiles(ca, cAtr, cXex, cCom, cExe, cBas, cCas, cSec, cOther);
+      if (ca > 0) { all = ca; atr = cAtr; xex = cXex; com = cCom; exe = cExe; bas = cBas; cas = cCas; sec = cSec; other = cOther; }
+      sourceOut = String(names[i]) + "_" + requestedType;
+      logf("[LIB-NDJSON-TYPE] read type=%s source=%s path=%s total=%lu page=%d pageSize=%d",
+           requestedType.c_str(), sourceOut.c_str(), paths[i].c_str(), (unsigned long)totalMatches, page, pageSize);
       return true;
     }
   }
-  sourceOut = "";
+
+  sourceOut = String("missing_type_") + requestedType;
   fileBytesOut = 0;
   return false;
 }
 
 static bool webLibraryNdjsonReadAllEntries(String& entries, uint32_t& count, String& sourceOut, uint32_t& fileBytesOut) {
+  // F44B: endpoint legacy armado desde los índices por tipo. No lee library_index.ndjson general.
   entries = "";
   count = 0;
   sourceOut = "";
   fileBytesOut = 0;
   if (!webAtrFsReady()) return false;
-  const char* paths[] = { WEB_LIBRARY_INDEX_NDJSON_PATH, WEB_LIBRARY_INDEX_NDJSON_BAK_PATH, WEB_LIBRARY_INDEX_NDJSON_PREV_PATH };
-  const char* names[] = { "ndjson", "ndjson_bak", "ndjson_prev" };
-  for (int i = 0; i < 3; i++) {
-    const char* path = paths[i];
-    if (!SPIFFS.exists(path)) continue;
-    File f = SPIFFS.open(path, "r");
+  for (int i = 0; i < WEB_LIBRARY_TYPE_INDEX_TYPE_COUNT; i++) {
+    String path = webLibraryNdjsonTypePath(String(WEB_LIBRARY_TYPE_INDEX_TYPES[i]));
+    if (!path.length() || !SPIFFS.exists(path.c_str())) continue;
+    File f = SPIFFS.open(path.c_str(), "r");
     if (!f) continue;
-    entries = "";
-    count = 0;
-    fileBytesOut = (uint32_t)f.size();
-    entries.reserve(fileBytesOut > 0 ? (fileBytesOut + 8) : 4096);
+    fileBytesOut += (uint32_t)f.size();
     while (f.available()) {
       String obj = f.readStringUntil('\n');
       obj.trim();
@@ -11435,12 +12036,13 @@ static bool webLibraryNdjsonReadAllEntries(String& entries, uint32_t& count, Str
       if ((count & 0x0F) == 0) yield();
     }
     f.close();
-    if (count > 0) {
-      sourceOut = names[i];
-      logf("[LIB-NDJSON] read all path=%s ok=1 bytes=%lu count=%lu pageBytes=%u",
-           path, (unsigned long)fileBytesOut, (unsigned long)count, (unsigned)entries.length());
-      return true;
-    }
+    yield();
+  }
+  if (count > 0) {
+    sourceOut = "type_ndjson_merged";
+    logf("[LIB-NDJSON-TYPE] read all from type indexes ok=1 bytes=%lu count=%lu pageBytes=%u",
+         (unsigned long)fileBytesOut, (unsigned long)count, (unsigned)entries.length());
+    return true;
   }
   entries = "";
   count = 0;
@@ -11968,24 +12570,61 @@ static void webAtrSendLightStatusJson(const char* action) {
   server.sendHeader("Connection", "close");
   server.send(200, "application/json", j);
 }
+
+static bool webAtrHasAnyMountedName() {
+  for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) {
+    if (g_webAtrMountedName[i].length() > 0) return true;
+  }
+  return false;
+}
+
+static bool webAtrRequestHasAnyMountFileArg() {
+  if (server.hasArg("unit") && server.hasArg("file") && server.arg("file").length() > 0) return true;
+  for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) {
+    char argn[4];
+    snprintf(argn, sizeof(argn), "d%d", i + 1);
+    if (server.hasArg(argn) && server.arg(argn).length() > 0) return true;
+  }
+  return false;
+}
+
 void handleSetWebAtr() {
-  // F16: montar/desmontar desde la web debe ser instantáneo.
-  // No escaneamos biblioteca, no validamos todas las unidades y no guardamos NVS antes de responder.
+  // F44J: proteger WEB-ATR contra autosaves stale/vacíos desde la UI.
+  // Si llega en=0&mask=0&force=0 sin archivo/unidad explícita mientras hay montajes,
+  // se ignora salvo que venga clear=1/off=1. Esto evita que una carga de pantalla o
+  // un estado vacío desmonte D1/D2 y mande la ruta a ESPNOW en plena operación.
   uint32_t t0 = millis();
   uint8_t changedMask = 0;
   bool btChanged = false;
+  bool configChanged = false;
+
+  const bool explicitClear = (server.hasArg("clear") && server.arg("clear").toInt() != 0) ||
+                             (server.hasArg("off") && server.arg("off").toInt() != 0);
+  const bool hasMountFileArg = webAtrRequestHasAnyMountFileArg();
+  const bool destructiveZeroRequest = server.hasArg("en") && server.hasArg("mask") && server.hasArg("force") &&
+                                      server.arg("en").toInt() == 0 &&
+                                      server.arg("mask").toInt() == 0 &&
+                                      server.arg("force").toInt() == 0 &&
+                                      !hasMountFileArg;
+
+  if (destructiveZeroRequest && !explicitClear && webAtrHasAnyMountedName()) {
+    logf("[WEB-ATR] set fast ignored stale zero request mounted=1 elapsed=%lu ms",
+         (unsigned long)(millis() - t0));
+    webAtrSendLightStatusJson("set_webatr_ignored_stale_zero");
+    return;
+  }
 
   if (server.hasArg("en")) {
     bool newEn = server.arg("en").toInt() != 0;
-    if (WEB_ATR_ENABLED != newEn) WEB_ATR_ENABLED = newEn;
+    if (WEB_ATR_ENABLED != newEn) { WEB_ATR_ENABLED = newEn; configChanged = true; }
   }
   if (server.hasArg("mask")) {
     uint8_t newMask = (uint8_t)(server.arg("mask").toInt() & DRIVE_UI_MAX_MASK);
-    if ((WEB_ATR_DEV_MASK & DRIVE_UI_MAX_MASK) != newMask) WEB_ATR_DEV_MASK = newMask;
+    if ((WEB_ATR_DEV_MASK & DRIVE_UI_MAX_MASK) != newMask) { WEB_ATR_DEV_MASK = newMask; configChanged = true; }
   }
   if (server.hasArg("force")) {
     uint8_t newForce = (uint8_t)(server.arg("force").toInt() & DRIVE_UI_MAX_MASK);
-    if ((WEB_ATR_FORCE_MASK & DRIVE_UI_MAX_MASK) != newForce) WEB_ATR_FORCE_MASK = newForce;
+    if ((WEB_ATR_FORCE_MASK & DRIVE_UI_MAX_MASK) != newForce) { WEB_ATR_FORCE_MASK = newForce; configChanged = true; }
   }
 
   for (int i = 0; i < WEB_ATR_MAX_UNITS; i++) {
@@ -11993,7 +12632,7 @@ void handleSetWebAtr() {
     snprintf(argn, sizeof(argn), "d%d", i + 1);
     if (server.hasArg(argn)) {
       String raw = server.arg(argn); raw.trim();
-      String clean = raw.length() ? webAtrSanitizeFileName(raw) : String("");
+      String clean = webAtrNormalizeRequestFile(raw);
       if (g_webAtrMountedName[i] != clean) {
         g_webAtrMountedName[i] = clean;
         webAtrResetResolvedSlot(i);
@@ -12006,7 +12645,7 @@ void handleSetWebAtr() {
     int u = server.arg("unit").toInt();
     if (u >= 1 && u <= WEB_ATR_MAX_UNITS) {
       String raw = server.arg("file"); raw.trim();
-      String clean = raw.length() ? webAtrSanitizeFileName(raw) : String("");
+      String clean = webAtrNormalizeRequestFile(raw);
       if (g_webAtrMountedName[u - 1] != clean) {
         g_webAtrMountedName[u - 1] = clean;
         webAtrResetResolvedSlot(u - 1);
@@ -12031,15 +12670,21 @@ void handleSetWebAtr() {
   // sin abrir metadata de todas las unidades en cada click.
   if (changedMask) webAtrRefreshPresenceMask(changedMask);
 
-  markDeferredConfigSave(true, btChanged);
-  logf("[WEB-ATR] set fast changed=0x%02X elapsed=%lu ms deferredNVS=1",
-       (unsigned)changedMask, (unsigned long)(millis() - t0));
+  const bool anythingChanged = configChanged || changedMask || btChanged;
+  if (anythingChanged) markDeferredConfigSave(configChanged || changedMask, btChanged);
+  logf("[WEB-ATR] set fast changed=0x%02X config=%u bt=%u elapsed=%lu ms deferredNVS=%u",
+       (unsigned)changedMask, configChanged ? 1 : 0, btChanged ? 1 : 0,
+       (unsigned long)(millis() - t0), anythingChanged ? 1 : 0);
 
   if (server.hasArg("reply") && server.arg("reply") == "full") handleAtrStatus();
   else webAtrSendLightStatusJson("set_webatr");
 }
 void handleAtrDelete() {
-  String name = server.hasArg("file") ? webAtrSanitizeFileName(server.arg("file")) : String("");
+  String raw = server.hasArg("file") ? server.arg("file") : String("");
+  raw.replace("\\", "/");
+  raw.trim();
+  String path = raw.startsWith("/") ? raw : String("");
+  String name = raw.startsWith("/") ? webLibraryBaseNameFromPath(raw) : webAtrSanitizeFileName(raw);
   if (name.length() == 0) {
     server.send(400, "text/plain", "Falta parametro file");
     return;
@@ -12049,7 +12694,7 @@ void handleAtrDelete() {
     return;
   }
   bool isCas = webCasLooksLikeName(name);
-  String path = isCas ? webCasPathForName(name) : webAtrPathForName(name);
+  if (!path.length()) path = isCas ? webCasPathForName(name) : webAtrPathForName(name);
   if (webAtrFsReady() && SPIFFS.exists(path)) SPIFFS.remove(path);
   webLibraryLiveScanCacheInvalidate("delete file");
   if (isCas) {
@@ -12401,12 +13046,20 @@ void handleCasAnalyze() {
   String path = "";
 
   if (server.hasArg("file")) {
-    name = webAtrSanitizeFileName(server.arg("file"));
+    String raw = server.arg("file");
+    raw.replace("\\", "/");
+    raw.trim();
+    if (raw.startsWith("/")) {
+      path = raw;
+      name = webLibraryBaseNameFromPath(raw);
+    } else {
+      name = webLibraryBaseNameFromPath(raw);
+      path = webCasPathForName(name);
+    }
     if (!webCasLooksLikeName(name)) {
       server.send(400, "application/json", "{\"ok\":false,\"error\":\"Parametro file debe ser .CAS\"}");
       return;
     }
-    path = webCasPathForName(name);
   } else if (g_casMounted && g_casMountedPath.length()) {
     name = g_casMountedName;
     path = g_casMountedPath;
@@ -12477,7 +13130,7 @@ void handleCasAnalyze() {
 
 
 void handleCasProfile() {
-  String name = server.hasArg("file") ? webAtrSanitizeFileName(server.arg("file")) : String("");
+  String name = server.hasArg("file") ? webLibraryBaseNameFromPath(server.arg("file")) : String("");
   if (!name.length() || !webCasLooksLikeName(name)) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"Falta archivo .CAS\"}");
     return;
@@ -12534,13 +13187,16 @@ void handleCasProfile() {
 }
 
 void handleCasMount() {
-  String name = server.hasArg("file") ? webAtrSanitizeFileName(server.arg("file")) : String("");
+  String raw = server.hasArg("file") ? server.arg("file") : String("");
+  raw.replace("\\", "/");
+  raw.trim();
+  String name = raw.startsWith("/") ? webLibraryBaseNameFromPath(raw) : webLibraryBaseNameFromPath(raw);
+  String path = raw.startsWith("/") ? raw : webCasPathForName(name);
   bool fastReply = server.hasArg("fast") && server.arg("fast").toInt() != 0;
   if (name.length() == 0 || !webCasLooksLikeName(name)) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"Falta archivo .CAS\"}");
     return;
   }
-  String path = webCasPathForName(name);
   if (!webAtrFsReady() || !SPIFFS.exists(path)) {
     casSetLastError(String("CAS no encontrado: ") + name);
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"CAS no encontrado\"}");
@@ -12591,7 +13247,7 @@ void handleCasMount() {
 }
 
 void handleCasDownload() {
-  String name = server.hasArg("file") ? webAtrSanitizeFileName(server.arg("file")) : String("");
+  String name = server.hasArg("file") ? webLibraryBaseNameFromPath(server.arg("file")) : String("");
   if (name.length() == 0 || !webCasLooksLikeName(name)) {
     server.send(400, "text/plain", "Falta archivo .CAS");
     return;
@@ -14042,8 +14698,8 @@ String jsonEscape(const String& in) {
   out.reserve(in.length() + 8);
   for (size_t i = 0; i < in.length(); i++) {
     char c = in.charAt(i);
-    if (c == '\\') out += "\\\\";
-    else if (c == '"') out += "\\\"";
+    if (c == '\\') out += "\\";
+    else if (c == '"') out += "\"";
     else if (c == '\n') out += "\\n";
     else if (c == '\r') out += "\\r";
     else if ((uint8_t)c < 32) out += ' ';
@@ -14777,6 +15433,7 @@ static bool startMasterSoftApS3Safe() {
 
   if (ok && ip != IPAddress(0, 0, 0, 0)) {
     logf("[WIFI] AP READY ssid=%s pass=%s ip=%s", MASTER_AP_SSID, MASTER_AP_PASS, ip.toString().c_str());
+    startMdnsIfStaReady();
     return true;
   }
 
@@ -14784,11 +15441,58 @@ static bool startMasterSoftApS3Safe() {
   return false;
 }
 
+static bool wifiStaAutoSafeForRealXf551(int* outRouterChannel) {
+  if (outRouterChannel) *outRouterChannel = 0;
+  if (!PRN_CFG.staEnabled || strlen(PRN_CFG.staSsid) == 0) return false;
+
+  // F44N: para recuperar acceso LAN "como antes" sin romper la XF551 real,
+  // se escanea el canal del router y luego se sincroniza el SLAVE/XF551 a ese canal.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  int n = WiFi.scanNetworks(false, true);
+  int foundChannel = 0;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == String(PRN_CFG.staSsid)) {
+      foundChannel = WiFi.channel(i);
+      break;
+    }
+  }
+  WiFi.scanDelete();
+
+  if (outRouterChannel) *outRouterChannel = foundChannel;
+
+  if (foundChannel <= 0) {
+    logf("[WIFI-LAN] STA auto omitido: SSID '%s' no encontrado en scan; AP http://192.168.50.1", PRN_CFG.staSsid);
+    return false;
+  }
+
+  g_staRouterChannelForSync = foundChannel;
+  if (foundChannel != (int)WIFI_CHANNEL) {
+    logf("[WIFI-LAN] STA auto canal encontrado: router '%s' ch=%d; se intentara sincronizar ESP-NOW/SLAVE desde ch=%u",
+         PRN_CFG.staSsid, foundChannel, (unsigned)WIFI_CHANNEL);
+  } else {
+    logf("[WIFI-LAN] STA auto seguro: router '%s' ch=%d coincide con canal base ESP-NOW=%u",
+         PRN_CFG.staSsid, foundChannel, (unsigned)WIFI_CHANNEL);
+  }
+  return true;
+}
+
 static void deferStaConnectAfterWebStart() {
   if (!PRN_CFG.staEnabled) return;
   if (strlen(PRN_CFG.staSsid) == 0) {
     logf("[WIFI] STA diferido omitido: SSID vacio");
     return;
+  }
+  if (REAL_XF551_ESPNOW_PRIORITY) {
+    int routerChannel = 0;
+    if (!wifiStaAutoSafeForRealXf551(&routerChannel)) {
+      g_staConnectDeferred = false;
+      logf("[WIFI-LAN] STA auto no iniciado; routerCh=%d. Web por AP http://192.168.50.1",
+           routerChannel);
+      return;
+    }
   }
   g_staConnectDeferred = true;
   g_staConnectAfterMs = millis() + 3500;
@@ -14799,8 +15503,12 @@ static void serviceDeferredStaConnect() {
   if (!g_staConnectDeferred) return;
   if ((int32_t)(millis() - g_staConnectAfterMs) < 0) return;
   g_staConnectDeferred = false;
-  logf("[WIFI-LAN] STA inicio diferido ahora");
+  if (g_staRouterChannelForSync >= 1 && g_staRouterChannelForSync <= 13 && g_staRouterChannelForSync != (int)espNowCurrentChannel()) {
+    espNowSendChannelSyncToSlaves((uint8_t)g_staRouterChannelForSync, "sta-auto");
+  }
+  logf("[WIFI-LAN] STA inicio diferido ahora routerCh=%d espNowWant=%u", g_staRouterChannelForSync, (unsigned)g_espNowDesiredChannel);
   connectPrinterStaWifi(false);
+  espNowLogChannelState("sta-connect-requested");
 }
 
 void handleBtDiskSet() {
@@ -15341,13 +16049,9 @@ void handleApiLibrary() {
   // F43K: commit explícito con NDJSON. Escanea desde botón, guarda/verifica línea por línea
   // y responde files[] por streaming seguro para evitar JSON truncado con pageSize alto.
   if (commitRefresh) {
-    webLibraryLiveScanCacheInvalidate("manual commit ndjson stream");
+    webLibraryLiveScanCacheInvalidate("manual commit type-folder ndjson stream");
     std::vector<WebLibraryScanEntry> commitEntries;
-    bool commitCacheHit = false;
-    uint32_t commitCacheAge = 0;
-    uint32_t commitCacheBuild = 0;
-    bool commitCacheOk = webLibraryLiveScanCacheGet(commitEntries, true, commitCacheHit, commitCacheAge, commitCacheBuild);
-    bool ndjsonSaved = commitCacheOk && webLibraryNdjsonSaveFromEntries(commitEntries);
+    bool ndjsonSaved = false;
 
     int cPageSize = server.hasArg("pageSize") ? server.arg("pageSize").toInt() : (server.hasArg("limit") ? server.arg("limit").toInt() : 50);
     if (cPageSize <= 0) cPageSize = 50;
@@ -15357,19 +16061,29 @@ void handleApiLibrary() {
     if (cPage < 0) cPage = 0;
     String cQ = server.hasArg("q") ? server.arg("q") : String(""); cQ.toLowerCase();
     String cType = server.hasArg("type") ? server.arg("type") : String(""); cType.toUpperCase();
+    cType = webLibraryNormalizeTypeForIndex(cType);
+    if (!cType.length()) {
+      String err = "{\"ok\":false,\"source\":\"library_type_folder_ndjson_commit\",\"refreshed\":true,\"manualRefresh\":true,\"indexCommit\":true,\"typeRequired\":true,\"message\":\"Usar type=ATR, CAS, XEX, COM, EXE, BAS, SEC u OTHER para refrescar un índice\",\"files\":[]}";
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(400, "application/json", err);
+      return;
+    }
+
+    uint32_t tScan0 = millis();
+    bool prevConsoleScan = g_webLibraryConsoleScan;
+    g_webLibraryConsoleScan = webLibraryConsoleScanArgEnabled();
+    webLibraryCollectEntriesForType(commitEntries, cType);
+    g_webLibraryConsoleScan = prevConsoleScan;
+    uint32_t commitCacheBuild = millis() - tScan0;
+    bool commitCacheOk = true;
 
     g_webLibraryIndexBuildMs = commitCacheBuild;
     g_webLibraryIndexCount = commitEntries.size();
 
-    if (!commitCacheOk) {
-      String err = "{\"ok\":false,\"source\":\"library_ndjson_commit\",\"refreshed\":true,\"manualRefresh\":true,\"indexCommit\":true,\"ndjson\":true,\"error\":\"SCAN_FAILED\",\"files\":[]}";
-      server.sendHeader("Cache-Control", "no-store");
-      server.send(500, "application/json", err);
-      return;
-    }
+    ndjsonSaved = webLibraryNdjsonSaveSingleTypeFromEntries(commitEntries, cType);
 
     webLibraryStreamApiResponseFromEntries(commitEntries,
-      String("library_ndjson_commit"), (commitCacheOk && ndjsonSaved), true, true, true, true, true,
+      String("library_type_folder_ndjson_commit"), (commitCacheOk && ndjsonSaved), true, true, true, true, true,
       cPage, cPageSize, cQ, cType, commitCacheBuild,
       ndjsonSaved ? String("") : g_webLibraryIndexLastSaveError);
     return;
@@ -15524,6 +16238,37 @@ void handleApiLibrary() {
   if (!manualRefresh) {
     if (pageSize > WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX) pageSize = WEB_LIBRARY_VISIBLE_PAGE_SIZE_MAX;
 
+    String requestedTypeForRead = webLibraryNormalizeTypeForIndex(type);
+    if (!requestedTypeForRead.length()) {
+      uint32_t ca = 0, cAtr = 0, cXex = 0, cCom = 0, cExe = 0, cBas = 0, cCas = 0, cSec = 0, cOther = 0;
+      webLibraryNdjsonTypeCountsFromFiles(ca, cAtr, cXex, cCom, cExe, cBas, cCas, cSec, cOther);
+      String json = "{\"ok\":true";
+      json += ",\"source\":\"library_type_required\"";
+      json += ",\"refreshed\":false";
+      json += ",\"autoScanDisabled\":true";
+      json += ",\"typeNdjsonOnly\":true";
+      json += ",\"generalIndexRemoved\":true";
+      json += ",\"message\":\"Biblioteca trabaja por tipo; usar type=ATR, CAS, XEX, COM, EXE, BAS, SEC u OTHER\"";
+      json += ",\"indexPath\":\"type-required\"";
+      json += ",\"page\":" + String(page);
+      json += ",\"pageSize\":" + String(pageSize);
+      json += ",\"total\":0";
+      json += ",\"typeCounts\":{";
+      json += "\"ALL\":" + String(ca);
+      json += ",\"ATR\":" + String(cAtr);
+      json += ",\"XEX\":" + String(cXex);
+      json += ",\"COM\":" + String(cCom);
+      json += ",\"EXE\":" + String(cExe);
+      json += ",\"BAS\":" + String(cBas);
+      json += ",\"CAS\":" + String(cCas);
+      json += ",\"SEC\":" + String(cSec);
+      json += ",\"OTHER\":" + String(cOther);
+      json += "},\"files\":[]}";
+      server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      server.send(200, "application/json", json);
+      return;
+    }
+
     String ndEntries;
     uint32_t ndTotal = 0;
     uint32_t ndAll = 0, ndAtr = 0, ndXex = 0, ndCom = 0, ndExe = 0, ndBas = 0, ndCas = 0, ndSec = 0, ndOther = 0;
@@ -15537,14 +16282,18 @@ void handleApiLibrary() {
       String json;
       json.reserve(4096 + ndEntries.length());
       json = "{\"ok\":true";
-      json += ",\"source\":\"library_ndjson_index\"";
+      json += ",\"source\":\"library_type_ndjson_index\"";
       json += ",\"indexSource\":\"" + jsonEscape(ndSource) + "\"";
       json += ",\"refreshed\":false";
       json += ",\"indexCommit\":false";
       json += ",\"autoScanDisabled\":true";
       json += ",\"ndjson\":true";
+      json += ",\"typeNdjson\":true";
       json += ",\"usedLegacyJson\":false";
-      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
+      String activeTypeIndex = webLibraryNormalizeTypeForIndex(type);
+      String activeIndexPath = activeTypeIndex.length() ? webLibraryNdjsonTypePath(activeTypeIndex) : String("");
+      json += ",\"indexPath\":\"" + jsonEscape(activeIndexPath) + "\"";
+      json += ",\"generalIndexRemoved\":true";
       json += ",\"legacyJsonPathDisabled\":\"/CONFIG/library_index.json\"";
       json += ",\"indexCount\":" + String(ndAll);
       json += ",\"indexFileBytes\":" + String(ndBytes);
@@ -15590,8 +16339,8 @@ void handleApiLibrary() {
       json += ",\"autoScanDisabled\":true";
       json += ",\"ndjson\":false";
       json += ",\"ndjsonMissing\":true";
-      json += ",\"message\":\"NDJSON no disponible; usando cache RAM creada por refresco manual\"";
-      json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
+      json += ",\"message\":\"Índice por tipo no disponible; usando cache RAM creada por refresco manual\"";
+      json += ",\"indexPath\":\"type-required\"";
       json += ",\"indexCount\":" + String(lcAll);
       json += ",\"indexBuildMs\":" + String(liveMs);
       json += ",\"indexLoadMs\":0";
@@ -15625,8 +16374,8 @@ void handleApiLibrary() {
     json += ",\"autoScanDisabled\":true";
     json += ",\"ndjson\":true";
     json += ",\"needsManualRefresh\":true";
-    json += ",\"message\":\"Presiona Refrescar biblioteca para escanear la SD y crear /CONFIG/library_index.ndjson\"";
-    json += ",\"indexPath\":\"" + jsonEscape(String(WEB_LIBRARY_INDEX_NDJSON_PATH)) + "\"";
+    json += ",\"message\":\"Presiona Refrescar biblioteca para escanear la SD y crear índices NDJSON por tipo\"";
+    json += ",\"indexPath\":\"type-required\"";
     json += ",\"page\":" + String(page);
     json += ",\"pageSize\":" + String(pageSize);
     json += ",\"total\":0";
@@ -15901,9 +16650,20 @@ static void webLibraryConsoleScanKnownDirs() {
 #if WEB_STORAGE_USE_SD
   webLibraryConsoleScanDir("/ATR", 0);
   webLibraryConsoleScanDir("/CAS", 0);
+  webLibraryConsoleScanDir("/XEX", 0);
+  webLibraryConsoleScanDir("/COM", 0);
+  webLibraryConsoleScanDir("/EXE", 0);
+  webLibraryConsoleScanDir("/BAS", 0);
+  webLibraryConsoleScanDir("/SEC", 0);
+  webLibraryConsoleScanDir("/FILES", 0);
   webLibraryConsoleScanDir("/LIBRARY", 0);
   webLibraryConsoleScanDir("/SD_CARD_CONTENT/ATR", 0);
   webLibraryConsoleScanDir("/SD_CARD_CONTENT/CAS", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/XEX", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/COM", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/EXE", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/BAS", 0);
+  webLibraryConsoleScanDir("/SD_CARD_CONTENT/SEC", 0);
   webLibraryConsoleScanRootShallow();
 #endif
   logf("[LIB-SD] ===== FIN ESCANEO SD Biblioteca: total=%lu ATR=%lu XEX=%lu CAS=%lu OTHER=%lu dirs=%lu skipped=%lu heap=%lu =====",
@@ -15955,16 +16715,17 @@ void handleApiLibraryScanConsole() {
 
 static bool apiMountWebAtrUnit(int unit, const String& requestedFile, String& err) {
   if (!apiValidateDriveUnit(unit)) { err = "Unidad inválida"; return false; }
-  String name = webAtrSanitizeFileName(requestedFile);
+  String name = webAtrNormalizeRequestFile(requestedFile);
   if (name.length() == 0) { err = "Falta archivo"; return false; }
-  String path = webAtrPathForName(name);
+
+  int idx = unit - 1;
+  String path;
   WebAtrMeta m;
-  if (!webAtrReadMetaFromPath(path, m)) {
-    err = String("ATR/XEX no encontrado o inválido: ") + name;
+  if (!webAtrEnsureMountablePathForIndex(idx, name, m, &path, &err)) {
+    if (!err.length()) err = String("ATR/XEX no encontrado o inválido: ") + name;
     return false;
   }
 
-  int idx = unit - 1;
   uint8_t bit = (uint8_t)(1u << idx);
   if (idx >= 4) DRIVE_VISIBLE_MASK |= bit;
 
@@ -18215,6 +18976,7 @@ void setup() {
   esp_now_register_recv_cb(onDataRecv);
   esp_now_register_send_cb(onDataSent);
 
+  espNowLogChannelState("init");
   ensurePeer(BCAST_MAC);
 
   // aplicar cfg a slaves + rp al inicio
@@ -18337,11 +19099,25 @@ void setup() {
   server.on("/glyph_get", HTTP_GET, handleGlyphGet);
   server.on("/glyph_set", HTTP_GET, handleGlyphSet);
   server.on("/glyph_restore", HTTP_GET, handleGlyphRestore);
+  server.on("/wifi_sta_on", HTTP_GET, []() {
+    int routerChannel = 0;
+    if (wifiStaAutoSafeForRealXf551(&routerChannel) && routerChannel >= 1 && routerChannel <= 13) {
+      if (routerChannel != (int)espNowCurrentChannel()) espNowSendChannelSyncToSlaves((uint8_t)routerChannel, "sta-manual");
+    }
+    connectPrinterStaWifi(false);
+    server.send(200, "application/json", "{\"ok\":1,\"message\":\"STA_CONNECT_REQUESTED_AUTO_CHANNEL\",\"apUrl\":\"http://192.168.50.1\"}");
+  });
+  server.on("/wifi_sta_off", HTTP_GET, []() {
+    WiFi.disconnect(false, false);
+    g_staConnectDeferred = false;
+    g_mdnsStarted = false;
+    logf("[WIFI-LAN] STA desconectado manual; AP sigue en http://192.168.50.1");
+    server.send(200, "application/json", "{\"ok\":1,\"message\":\"STA_DISCONNECTED_AP_STILL_ON\",\"apUrl\":\"http://192.168.50.1\"}");
+  });
   server.begin();
   Serial.println("[WEB] Servidor HTTP iniciado en puerto 80");
 
-  // V120: no bloquear ni matar el AP durante el arranque.
-  // La conexión STA hacia la red de la impresora se inicia unos segundos después.
+  // F44N: AP/web queda disponible y STA puede sincronizar canal ESP-NOW automaticamente.
   deferStaConnectAfterWebStart();
 }
 

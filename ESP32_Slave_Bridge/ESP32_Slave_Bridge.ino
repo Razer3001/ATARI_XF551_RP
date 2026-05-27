@@ -21,7 +21,7 @@
 #include "EspNowQueueTypes.h"
 #include "BridgeProtocol.h"
 
-static const char SLAVE_BUILD[] = "F24_CODE_CLEAN_STEP1_2026-05-21_1325";
+static const char SLAVE_BUILD[] = "F44N_ESPNOW_AUTO_CHANNEL_SYNC_2026-05-26_2125";
 
 #ifndef TYPE_SUPERDOS_HINT
 #define TYPE_SUPERDOS_HINT 0x42
@@ -55,6 +55,7 @@ enum DriveProfile : uint8_t;
 #define MAX_PREFETCH_SECTORS 26
 
 #define ESPNOW_CHANNEL 1
+static uint8_t g_espNowChannel = ESPNOW_CHANNEL;
 
 static inline uint32_t getLE32(const uint8_t* p) {
   return (uint32_t)p[0] |
@@ -583,6 +584,12 @@ uint8_t sioChecksum(const uint8_t* d, int len) {
   return (uint8_t)(s & 0xFF);
 }
 
+uint8_t calcChecksum(const uint8_t* d, int len) {
+  uint16_t s = 0;
+  for (int i = 0; i < len; i++) s += d[i];
+  return (uint8_t)s;
+}
+
 static bool isBroadcastMac(const uint8_t* mac) {
   if (!mac) return false;
   for (int i = 0; i < 6; i++) if (mac[i] != 0xFF) return false;
@@ -591,17 +598,31 @@ static bool isBroadcastMac(const uint8_t* mac) {
 
 void ensurePeer(const uint8_t* mac) {
   if (!mac) return;
-  if (esp_now_is_peer_exist(mac)) return;
+  if (esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t existing = {};
+    if (esp_now_get_peer(mac, &existing) == ESP_OK && existing.channel != 0) {
+      existing.channel = 0; // usar canal Wi-Fi actual
+      existing.encrypt = false;
+      existing.ifidx = WIFI_IF_STA;
+      if (esp_now_mod_peer(&existing) != ESP_OK) {
+        esp_now_del_peer(mac);
+      } else {
+        return;
+      }
+    } else {
+      return;
+    }
+  }
 
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = ESPNOW_CHANNEL;
+  p.channel = 0; // F44N: seguir el canal actual configurado por esp_wifi_set_channel()
   p.encrypt = false;
   p.ifidx = WIFI_IF_STA;
 
   esp_err_t e = esp_now_add_peer(&p);
   if (e != ESP_OK && e != ESP_ERR_ESPNOW_EXIST) {
-    logf("[ESPNOW] esp_now_add_peer fallo err=%d", (int)e);
+    logf("[ESPNOW] esp_now_add_peer fallo err=%d ch=%u", (int)e, (unsigned)g_espNowChannel);
   }
 }
 
@@ -628,6 +649,24 @@ bool send_now_to(const uint8_t* mac, const uint8_t* data, int len) {
   }
   markActivity();
   throttleNet();
+  return true;
+}
+
+static bool espNowApplyChannel(uint8_t ch, const char* reason) {
+  if (ch < 1 || ch > 13) return false;
+  if (ch == g_espNowChannel) {
+    logf("[ESPNOW-CH] canal ya activo ch=%u reason=%s", (unsigned)ch, reason ? reason : "sync");
+    return true;
+  }
+  logf("[ESPNOW-CH] cambiando canal %u -> %u reason=%s", (unsigned)g_espNowChannel, (unsigned)ch, reason ? reason : "sync");
+  g_espNowChannel = ch;
+  esp_now_del_peer(BCAST_MAC);
+  if (g_haveMasterMac) esp_now_del_peer(g_lastMaster);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(g_espNowChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  ensurePeer(BCAST_MAC);
+  if (g_haveMasterMac) ensurePeer(g_lastMaster);
   return true;
 }
 
@@ -2541,6 +2580,19 @@ static void processIncomingPacket(const uint8_t* src, const uint8_t* in, int len
     return;
   }
 
+  if (type == TYPE_ESPNOW_CHANNEL_SYNC && len >= 2) {
+    uint8_t ch = in[1];
+    uint8_t chk = (len >= 4) ? in[3] : calcChecksum(in, min(len, 3));
+    bool chkOk = (len < 4) || (chk == calcChecksum(in, 3));
+    logf("[ESPNOW-CH] sync recibido ch=%u chk=%u", (unsigned)ch, chkOk ? 1 : 0);
+    if (chkOk && espNowApplyChannel(ch, "master-sync")) {
+      delay(80);
+      sendHello();
+      g_lastHelloMs = millis();
+    }
+    return;
+  }
+
   if (type == TYPE_SUPERDOS_HINT && len >= 3) {
     // v15: ignorar hint en SLAVE para S/E estilo v6
     return;
@@ -2684,7 +2736,7 @@ void setup() {
   WiFi.setSleep(false);
 
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(g_espNowChannel, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
